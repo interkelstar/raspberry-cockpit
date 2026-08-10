@@ -2,6 +2,25 @@
 
 [Cockpit](https://cockpit-project.org/) on Raspberry Pi OS, with the parts the distribution doesn't give you: **your actual desktop in a browser tab**, a **file browser**, VM and container management, and branding that says *Raspberry Pi OS* instead of a generic Debian wordmark.
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/interkelstar/raspberry-cockpit/master/get.sh | bash
+```
+
+Then open `https://<your-pi>:9090`.
+
+<details>
+<summary>Prefer to read it first? (you should)</summary>
+
+```sh
+git clone https://github.com/interkelstar/raspberry-cockpit
+cd raspberry-cockpit
+./install.sh --dry-run        # print the plan, touch nothing
+./install.sh
+```
+
+`get.sh` clones the repository to `~/.local/share/raspberry-cockpit` and runs `install.sh` from there — the installer is not a single file (it needs `desktop/` and `branding/`), and keeping the clone means `verify.sh` and `--uninstall` stay available afterwards.
+</details>
+
 ```
 ./install.sh                  everything
 ./install.sh --only desktop   one part: cockpit, files, desktop, branding
@@ -11,7 +30,11 @@
 ./install.sh --uninstall      remove what this added
 ```
 
-Then open `https://<your-pi>:9090`.
+Arguments pass through the one-liner too:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/interkelstar/raspberry-cockpit/master/get.sh | bash -s -- --only desktop
+```
 
 ## What you get
 
