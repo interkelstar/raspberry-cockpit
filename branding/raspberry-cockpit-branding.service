@@ -1,0 +1,8 @@
+[Unit]
+Description=Apply Cockpit branding (Raspberry Pi OS)
+# Reason to exist: the branding directory belongs to the cockpit-ws package, and
+# upgrading it restores the Debian default. Triggered by the .path watcher.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/raspberry-cockpit-branding

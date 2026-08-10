@@ -1,0 +1,9 @@
+{
+  "name": "raspberry-cockpit",
+  "version": "1.0.0",
+  "description": "Cockpit on Raspberry Pi OS: a desktop tab over noVNC, a file browser, VM/container management and honest branding",
+  "type": "module",
+  "private": true,
+  "scripts": { "test": "node --test test/*.test.js" },
+  "license": "MIT"
+}

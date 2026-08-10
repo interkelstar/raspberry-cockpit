@@ -1,0 +1,46 @@
+/* Cockpit branding: "Raspberry Pi OS" with the raspberry, instead of a generic
+ * Debian wordmark.
+ *
+ * WHERE THIS HAS TO LIVE, and why it is not obvious. cockpit-ws looks for a
+ * branding directory in three hard-coded paths (visible in the binary's strings):
+ *
+ *     /usr/share/cockpit/branding/$ID-$VARIANT_ID
+ *     /usr/share/cockpit/branding/$ID            <- owned by the cockpit-ws package
+ *     /usr/share/cockpit/branding/default
+ *
+ * The first one looks like the clean answer and is not: the second component is
+ * VARIANT_ID, which Debian does not define at all, so the path is skipped
+ * (a debian-13/ directory was created on a live board and never picked up).
+ * A copy under /usr/local/share does not work either — the paths are absolute
+ * and XDG_DATA_DIRS has nothing to do with branding. That leaves $ID, which the
+ * package owns; hence the watcher unit that re-applies after an upgrade.
+ *
+ * os-release is left honest: the system really is Debian. Only the caption
+ * changes. ${…} is substituted by cockpit-ws from os-release.
+ */
+
+#badge {
+    inline-size: 96px;
+    block-size: 96px;
+    background-image: url("logo.png");
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+
+    /* The light plate is required by the artwork itself: the raspberry is drawn
+     * with a BLACK outline (54% of its opaque pixels are pure black). On a dark
+     * theme that outline merges into the background and all that remains is red
+     * berries and green leaves floating in mid-air. The plate is always light —
+     * on a light theme it is nearly indistinguishable from the card, on a dark
+     * one it gives the logo an edge. */
+    background-color: #f4f4f4;
+    border-radius: 18px;
+    padding: 10px;
+    background-origin: content-box;
+    box-sizing: border-box;
+}
+
+/* login.js injects this as HTML, so <b> really does render bold. */
+#brand::before {
+    content: "Raspberry Pi OS <b>${VERSION_CODENAME}</b>";
+}

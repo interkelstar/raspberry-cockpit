@@ -1,0 +1,10 @@
+{
+  "version": 0,
+  "dashboard": {
+    "desktop": {
+      "label": "Desktop",
+      "path": "index.html",
+      "order": 1
+    }
+  }
+}

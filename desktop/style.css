@@ -1,0 +1,27 @@
+html, body {
+  margin: 0;
+  height: 100%;
+}
+/* Match the native Cockpit page card: inset from the nav (spacer--lg = 24px) + rounded
+   corners (radius--medium = 16px). The radius is set live by app.js, CLAMPED to the noVNC
+   letterbox, so it never clips the actual desktop (pan/actual-size fills the canvas -> 0).
+   Fullscreen / phone viewport -> .ad-flush (no inset, no radius: matches native's mobile
+   collapse, and avoids eating space where the nav is a drawer). Gutter colour is the shell
+   page bg via syncGutterBg; #151515 is the pre-JS / JS-failure fallback. */
+body {
+  box-sizing: border-box;
+  padding: 24px;
+  background: #151515;
+}
+#screen {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 0;
+}
+body.ad-flush {
+  padding: 0;
+}
+body.ad-flush #screen {
+  border-radius: 0 !important;
+}

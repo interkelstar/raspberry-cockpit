@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch the Cockpit branding (a package upgrade can wipe it)
+
+[Path]
+# PathChanged rather than PathModified: we care about the file being closed after
+# a write — a completed replacement by the package — not about every partial write.
+PathChanged=/usr/share/cockpit/branding/debian/branding.css
+# Watch the logo too: an upgrade may restore the symlink to debian-logo.png
+# without touching the css, leaving our caption beside someone else's picture.
+PathChanged=/usr/share/cockpit/branding/debian/logo.png
+
+[Install]
+WantedBy=multi-user.target
