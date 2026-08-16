@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
     createTrackpad, gainFor,
     MIN_GAIN, MAX_GAIN, FAST_SPEED,
-    TAP_MAX_MS, TAP_SLOP, DRAG_ARM_MS, LONG_PRESS_MS,
+    TAP_MAX_MS, TAP_SLOP, DRAG_ARM_MS, DRAG_ARM_SLOP, LONG_PRESS_MS,
 } from "../desktop/trackpad.js";
 
 const p = (id, x, y) => ({ id, x, y });
@@ -104,6 +104,25 @@ test("a plain double tap is two clicks, with no stray press between them", () =>
     assert.deepEqual(t.touchEnd([], 50), [{ t: "click", button: 0 }]);
     t.touchStart([p(2, 100, 100)], 120);
     assert.deepEqual(t.touchEnd([], 170), [{ t: "click", button: 0 }]);
+});
+
+// Time alone cannot tell "tap, then drag from here" from "tap, then reach
+// somewhere else and slide". Without the distance condition, widening the window
+// to something a hand can actually hit turns ordinary repositioning into drags.
+test("touching again far away is an ordinary touch, not a drag", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchEnd([], 50);
+    t.touchStart([p(2, 100 + DRAG_ARM_SLOP + 5, 100)], 100);
+    assert.deepEqual(types(t.touchMove([p(2, 200, 100)], 150)), ["move"]);
+});
+
+test("touching again nearby, well inside the window, does drag", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchEnd([], 50);
+    t.touchStart([p(2, 100 + DRAG_ARM_SLOP - 5, 100)], 50 + DRAG_ARM_MS - 1);
+    assert.deepEqual(types(t.touchMove([p(2, 200, 100)], 50 + DRAG_ARM_MS + 40)), ["down", "move"]);
 });
 
 test("touching again too late is an ordinary touch, not a drag", () => {

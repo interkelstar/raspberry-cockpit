@@ -22,10 +22,10 @@
 // A press longer than this, or one that wandered further than the slop, is not a
 // tap — it was a drag, and the click must not be delivered on release.
 //
-// It mirrors LONG_PRESS_MS deliberately, and generously. A press that outlives
-// the window has ALREADY become a drag by then (tick pressed the button and the
-// release goes down the other branch), so a short window buys nothing and costs
-// real taps: the clock starts at the FIRST finger, and a two-finger tap needs
+// It sits above LONG_PRESS_MS deliberately, and generously. A press that lasts
+// that long has ALREADY become a drag (tick pressed the button and the release
+// goes down the other branch), so this value only ever decides the case where
+// no timer ran — and a short window there buys nothing while costing real taps: the clock starts at the FIRST finger, and a two-finger tap needs
 // time for the second finger to land, for both to be noticed, and for both to
 // lift. Measured against a browser dispatching real touch events, a two-finger
 // tap comfortably exceeds a quarter of a second, and the right click it should
@@ -42,7 +42,21 @@ export const TAP_SLOP = 12;
 // ordinary — and pressing immediately turns that intended RIGHT click into a
 // left one, which reads as "right click just doesn't work in this mode". It
 // also puts a stray press-release around every plain double tap.
-export const DRAG_ARM_MS = 300;
+//
+// The window is measured from the first tap's RELEASE to the second PRESS,
+// which is a shorter span than the double-tap timeouts usually quoted — those
+// run press-to-press and include the whole first tap. 300ms measured this way
+// dropped roughly half of real attempts on a phone: the gesture "worked" in
+// tests and did not work in a hand. Widened, and the space condition below
+// carries the discrimination instead.
+export const DRAG_ARM_MS = 500;
+
+// ...and the second touch has to land near the first. Time alone is a poor
+// discriminator between "tap, then drag from here" and "tap, then reach
+// somewhere else to slide", and a widened window makes that worse; requiring
+// the finger to come back down where it left cuts the false drags without
+// narrowing the window again.
+export const DRAG_ARM_SLOP = 45;
 
 // How much the gap between two fingers must change before the gesture is a
 // pinch rather than a two-finger scroll. Whichever moved further — the gap or
@@ -52,9 +66,11 @@ export const DRAG_ARM_MS = 300;
 export const PINCH_SLOP = 8;
 
 // Holding still this long presses the button without a preceding tap. This is
-// the discoverable way to drag: put a finger down on a window title bar, wait,
-// move. Longer than TAP_MAX_MS by a wide margin so the two never race.
-export const LONG_PRESS_MS = 500;
+// the OTHER way to drag, and the one that always works: put a finger down,
+// wait, move. It costs nothing to make it quick — a long press that ends
+// without moving is a press and a release at one spot, which is a click, so
+// shortening it cannot turn an intended click into anything else.
+export const LONG_PRESS_MS = 400;
 
 // Pointer acceleration. A fixed 1:1 mapping is unusable on a phone: the canvas
 // is a 1920px desktop scaled into ~390px of screen, so one finger pixel is
@@ -104,7 +120,7 @@ export function createTrackpad() {
     let scrollFrom = null;   // centroid baseline while two fingers are down
     let held = null;         // button currently held, or null
     let armed = false;       // a tap-tap-drag is pending: press once it moves
-    let lastTapAt = null;    // end of the previous tap, for DRAG_ARM_MS
+    let lastTap = null;      // {at, x, y} of the previous tap, for the arm window
     let twoMode = null;      // once two fingers are down: null | "scroll" | "pinch"
     let twoFrom = null;      // spread + centroid when the second finger landed
     let prevSpread = 0;
@@ -136,10 +152,12 @@ export function createTrackpad() {
                 start = { x: p.x, y: p.y, at: now };
                 moved = false;
 
-                if (held === null && lastTapAt !== null && (now - lastTapAt) <= DRAG_ARM_MS) {
+                if (held === null && lastTap !== null &&
+                    (now - lastTap.at) <= DRAG_ARM_MS &&
+                    Math.hypot(p.x - lastTap.x, p.y - lastTap.y) <= DRAG_ARM_SLOP) {
                     armed = true;
                 }
-                lastTapAt = null;
+                lastTap = null;
             }
 
             if (points.length >= 2) {
@@ -246,7 +264,8 @@ export function createTrackpad() {
                 // A held button that was never dragged is the second half of a
                 // tap-tap-drag that turned out to be an ordinary double tap.
                 // Keep the chain open so a third tap still arms a drag.
-                lastTapAt = (!moved && (now - start.at) <= TAP_MAX_MS) ? now : null;
+                lastTap = (!moved && (now - start.at) <= TAP_MAX_MS)
+                    ? { at: now, x: last.x, y: last.y } : null;
                 held = null;
             } else if (!moved && (now - start.at) <= TAP_MAX_MS) {
                 const button = tapButton();
@@ -254,9 +273,9 @@ export function createTrackpad() {
                 // Only a one-finger tap can arm a drag. Chaining a drag onto a
                 // right-click would press the LEFT button, which is not what the
                 // finger asked for.
-                lastTapAt = button === 0 ? now : null;
+                lastTap = button === 0 ? { at: now, x: last.x, y: last.y } : null;
             } else {
-                lastTapAt = null;
+                lastTap = null;
             }
 
             reset();
@@ -279,7 +298,7 @@ export function createTrackpad() {
         cancel() {
             const out = [];
             if (held !== null) { out.push({ t: "up", button: held }); held = null; }
-            lastTapAt = null;
+            lastTap = null;
             reset();
             return out;
         },

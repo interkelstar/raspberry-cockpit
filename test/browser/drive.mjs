@@ -173,7 +173,7 @@ check("a two-finger tap is a right click", two.some((m) => m.mask === 4),
 await settle();
 await reset();
 await tp("touchStart", [{ id: 1, ...mid }]);
-await sleep(700);
+await sleep(500);   // LONG_PRESS_MS is 400 — this must clear it, not dwarf it
 for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 1, x: mid.x + i * 12, y: mid.y }]);
 await tp("touchEnd", []);
 const held = await sent();
@@ -182,16 +182,38 @@ check("a long press starts a drag and holds the button through it",
       `${held.filter((m) => m.mask === 1).length} moves with the button down, ends mask=${held[held.length - 1] && held[held.length - 1].mask}`);
 
 // Tap, then touch again and slide -> the same drag, without the wait.
+//
+// The pauses here are the point. Fired back to back this passed while the
+// gesture was failing about half the time in a hand: a real double-tap-drag has
+// a gap between the tap and the second touch, and a further pause before the
+// finger starts moving. Anything that judges timing has to be tested with the
+// timing it will actually see.
 await settle();
 await reset();
-await tp("touchStart", [{ id: 1, ...mid }]);
-await tp("touchEnd", []);
-await tp("touchStart", [{ id: 2, ...mid }]);
+await tp("touchStart", [{ id: 1, ...mid }], 70);
+await tp("touchEnd", [], 300);                      // human gap after the tap
+await tp("touchStart", [{ id: 2, ...mid }], 150);   // and a dwell before moving
 for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x, y: mid.y + i * 12 }]);
 await tp("touchEnd", []);
 const chain = await sent();
-check("tap-then-slide drags as well", chain.filter((m) => m.mask === 1).length >= 3,
+check("tap, pause, touch and slide drags", chain.filter((m) => m.mask === 1).length >= 3,
       JSON.stringify(chain.map((m) => m.mask)));
+
+// Reaching somewhere else after a tap is repositioning, not a drag. This is the
+// cost of a window wide enough to hit, and what the distance condition buys back.
+await settle();
+await reset();
+await tp("touchStart", [{ id: 1, ...mid }], 70);
+await tp("touchEnd", [], 250);
+await tp("touchStart", [{ id: 2, x: mid.x + 120, y: mid.y }], 120);
+for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + i * 12 }]);
+await tp("touchEnd", []);
+const far2 = await sent();
+// Exactly one press: the tap's own. A drag would add a second, held across the
+// moves that follow.
+check("touching down elsewhere after a tap moves the pointer, it does not drag",
+      far2.filter((m) => m.mask === 1).length === 1,
+      JSON.stringify(far2.map((m) => m.mask)));
 
 // Two fingers sliding -> wheel. noVNC turns wheel into buttons 4/5 (mask 8/16).
 await settle();

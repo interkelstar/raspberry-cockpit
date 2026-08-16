@@ -70,7 +70,7 @@ A 1920px desktop scaled into a phone means a fingertip covers a good part of a w
 | **Direct touch** (hand icon) | you tap, it clicks there |
 | **Trackpad** (touchpad icon) | the screen is a touchpad; slide to push a visible pointer, tap to click wherever it is |
 
-In trackpad mode: **tap** left-click · **two-finger tap** right-click · **three-finger tap** middle-click · **two fingers sliding** scroll · **tap then touch again and slide**, or **press and hold then slide**, drag. Slow movement is geared down and fast movement geared up, so the pointer can be both precise and cross the screen — the same acceleration curve that lets a small physical trackpad drive a large display.
+In trackpad mode: **tap** left-click · **two-finger tap** right-click · **three-finger tap** middle-click · **two fingers sliding** scroll. To **drag** — a window, a resize edge, a scrollbar — either tap and then touch down again in the same place and slide, or simply press and hold for a moment before sliding. Slow movement is geared down and fast movement geared up, so the pointer can be both precise and cross the screen — the same acceleration curve that lets a small physical trackpad drive a large display.
 
 **Pinch zooms**, in either mode: spreading two fingers leaves "fit" and magnifies from exactly what you were looking at, pinching back below the fit scale returns to fit. While pinching, the fingers also drag the view, because otherwise a zoomed-in desktop would have no gesture that pans it — two-finger drag is a scroll wheel and belongs to whichever app has focus. The 🔍+ / 🔍− button remains the way back to a known scale: actual pixels, or the whole screen.
 
@@ -120,6 +120,8 @@ Related, and the reason the scoping test is geometric: deciding "is this touch m
 
 **Pressing the button when the finger lands is not the same as arming a drag.** A tap that arms the next touch, and presses immediately on it, turns an ordinary tap-then-two-finger-tap into a *left* click — reported from a phone as "right click just doesn't work". Arming must wait for actual movement before it commits to a button.
 
+**Gesture timing has to be tested with the timing it will actually see.** The double-tap-drag was covered by a test that fired its touch events back to back, and it passed while the gesture was failing about half the time in a hand. A real one has a gap after the tap and a further pause before the finger moves; measured against those, a 300ms arm window — counted from the tap's *release*, which is shorter than the press-to-press double-tap timeouts usually quoted — missed most attempts. The window is now 500ms, with the discrimination carried by a distance condition instead: the second touch has to land where the first one was, so reaching elsewhere to reposition the pointer stays a reposition.
+
 **A tap window measured from the first finger is not a tap window.** A two-finger tap needs time for the second finger to land, be noticed, and lift; a quarter of a second is not enough and the right click simply never arrives. The threshold is now the long-press timeout, which is also the only value that cannot conflict with it.
 
 **`wayvnc` without `--config` reads `~/.config/wayvnc/config`** — someone else's file. On the test board it began with `[wayvnc]`, and this parser has no sections: `Failed to load config. Error on line 1`.
@@ -153,7 +155,7 @@ npm run test:browser    # real touch input through real chromium, ~30s
 
 40 tests. Several are regression locks, and each was checked for its **ability to fail** — the fix removed, the suite run, exactly the expected test red. Two of them did not fail, which is how it came out that treating a hand-off between fingers as movement drops half of all right clicks: whichever finger leaves first is a coin toss.
 
-`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. 21 checks. It found a right click arriving as a middle click, a two-finger tap being silently dropped, a stray pointer grab that killed the toolbar, and zooming out shrinking the picture instead of showing more desktop.
+`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. 22 checks. It found a right click arriving as a middle click, a two-finger tap being silently dropped, a stray pointer grab that killed the toolbar, and zooming out shrinking the picture instead of showing more desktop. Note what it could *not* pin down: the exact arm window, because CDP round-trip latency swamps a 200ms difference. Timing constants are locked by the unit tests, which have an exact clock.
 
 ## A note on verification
 
