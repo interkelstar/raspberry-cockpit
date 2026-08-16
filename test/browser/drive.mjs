@@ -244,6 +244,43 @@ await sleep(400);
 const scale1 = await evaluate(scaleProbe);
 check("pinching out zooms in", scale1 > scale0 * 1.15, `scale ${scale0.toFixed(3)} -> ${scale1.toFixed(3)}`);
 
+// Zooming must change how MUCH desktop is visible, never how big the picture
+// of it is. The viewport is in framebuffer pixels and the canvas is laid out at
+// scale x viewport, so a viewport set to the container size leaves the canvas
+// exactly `scale` times too small — a shrinking window onto the same content,
+// which is the opposite of zooming.
+const fill = () => evaluate(`(() => {
+  const c = document.querySelector('#screen canvas');
+  const s = document.getElementById('screen');
+  return { drawn: Math.round(c.getBoundingClientRect().width), container: Math.round(s.getBoundingClientRect().width), viewport: c.width };
+})()`);
+const zoomedIn = await fill();
+check("zoomed in, the desktop still fills the window",
+      Math.abs(zoomedIn.drawn - zoomedIn.container) <= 2,
+      `drawn ${zoomedIn.drawn}px in a ${zoomedIn.container}px container`);
+
+await settle();
+await burst([
+  ["touchStart", [{ id: 1, x: mid.x - 140, y: mid.y }]],
+  ["touchStart", [{ id: 1, x: mid.x - 140, y: mid.y }, { id: 2, x: mid.x + 140, y: mid.y }]],
+  ["touchMove", [{ id: 1, x: mid.x - 100, y: mid.y }, { id: 2, x: mid.x + 100, y: mid.y }]],
+  ["touchMove", [{ id: 1, x: mid.x - 70, y: mid.y }, { id: 2, x: mid.x + 70, y: mid.y }]],
+  ["touchEnd", [{ id: 2, x: mid.x + 70, y: mid.y }]],
+  ["touchEnd", []],
+]);
+await sleep(400);
+const zoomedOut = await fill();
+check("zooming back out shows MORE desktop, at the same size on screen",
+      zoomedOut.viewport > zoomedIn.viewport && Math.abs(zoomedOut.drawn - zoomedOut.container) <= 2,
+      `${zoomedIn.viewport} -> ${zoomedOut.viewport} desktop px, drawn ${zoomedOut.drawn}px in ${zoomedOut.container}px`);
+
+check("the toolbar is in the order keyboard, pointer, zoom, fullscreen",
+      (await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title.split(/[ —]/)[0]).join(",")`))
+        === "Keyboard,Trackpad,Fit,Fullscreen" ||
+      (await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title.split(/[ —]/)[0]).join(",")`))
+        === "Keyboard,Direct,Fit,Fullscreen",
+      await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title).join(" | ")`));
+
 // The visible pointer: noVNC's own cursor overlay must be there and following.
 const cur = await evaluate(`(() => {
   const cs = [...document.body.children].filter(e => e.tagName === 'CANVAS' && e.style.position === 'fixed');

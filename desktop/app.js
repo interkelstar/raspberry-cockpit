@@ -55,14 +55,23 @@ try {
 
 // _display is private, but Display.scale is a public property of a public class,
 // and there is no route to manual scaling through RFB: scaleViewport is
-// all-or-nothing autoscale. Assigning clipViewport again (to the value it
-// already has) is not a no-op — the setter re-runs _updateClip, which is what
-// resizes the viewport and fixes the scrollbars for the new scale.
+// all-or-nothing autoscale.
+//
+// The viewport size has to be set here too, and it is the whole reason zooming
+// out used to SHRINK the desktop instead of showing more of it. The viewport is
+// measured in framebuffer pixels while the canvas is laid out at
+// scale x viewport, so filling a container of C css pixels needs a viewport of
+// C / scale. noVNC's own _updateClip passes the container size straight through,
+// which is right only at scale 1 — clipping and scaling are never combined in
+// stock noVNC, since scaleViewport turns clipping off. Reusing it left the
+// canvas exactly `scale` times too small, i.e. a smaller picture of the same
+// amount of desktop: the opposite of zooming out.
 function applyZoom() {
   if (!rfb) return;
   try {
+    const b = screenEl.getBoundingClientRect();
     rfb._display.scale = zoom;
-    rfb.clipViewport = true;
+    rfb._display.viewportChangeSize(b.width / zoom, b.height / zoom);
   } catch (e) { /* no scaling available — stay wherever noVNC put us */ }
 }
 
@@ -806,8 +815,11 @@ function setPointerMode(mode) {
   bar.addEventListener("pointerenter", wake);
   bar.addEventListener("pointerleave", dim);
   bar.addEventListener("pointerdown", wake);
+  // Order: keyboard, pointer mode, zoom, fullscreen — the two touch-only buttons
+  // first, so the pair that also exists on a desktop keeps the same position at
+  // the end of the bar rather than shifting with the viewport.
+  if (isTouch) bar.append(kbBtn, ptrBtn);
   bar.append(fitBtn, fsBtn);
-  if (isTouch) bar.append(ptrBtn, kbBtn);
   document.body.appendChild(bar);
 })();
 
