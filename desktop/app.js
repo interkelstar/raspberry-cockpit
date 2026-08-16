@@ -2,8 +2,22 @@ import RFB from "./novnc/core/rfb.js";
 // The port lives in its own module so the parsing can be unit-tested: this file
 // touches the DOM and noVNC on import and cannot be loaded under node.
 import { readPort, DEFAULT_PORT } from "./config.js";
+// Same reason again: the gesture recognition is where the decisions are, so it
+// lives apart from the DOM and is unit-tested.
+import { createTrackpad, LONG_PRESS_MS } from "./trackpad.js";
 
 let rfb;
+
+// Pointer mode. "touch" is direct: you tap where you want to click, which is what
+// noVNC does on its own. "trackpad" is relative: the screen becomes a touchpad,
+// the finger pushes a visible pointer around, and clicks land wherever that
+// pointer is. Direct touch is unusable for anything small — a 1920px desktop
+// scaled into a phone means a fingertip covers a good fraction of a window's
+// title bar — which is why Chrome Remote Desktop offers exactly this pair.
+let pointerMode = "touch";
+try {
+  if (localStorage.getItem("ad-desktop-pointer") === "trackpad") pointerMode = "trackpad";
+} catch (e) { /* private mode */ }
 
 // Viewport mode (mobile-friendly): "fit" scales the whole FHD desktop into the view
 // (default, good overview); "pan" shows actual pixels and lets the user drag the viewport
@@ -15,7 +29,10 @@ function applyViewportMode() {
   if (!rfb) return;
   rfb.scaleViewport = !panMode;
   rfb.clipViewport = panMode;
-  rfb.dragViewport = panMode;
+  // dragViewport must be OFF in trackpad mode even when panning. It is checked
+  // inside noVNC's mouse handling, not its touch handling, so it would swallow
+  // the synthetic press we send for a tap and turn every click into a pan.
+  rfb.dragViewport = panMode && pointerMode !== "trackpad";
 }
 
 // Port of the local VNC server. It lives in a variable and NOT as a connect()
@@ -144,6 +161,9 @@ clipEl.addEventListener("paste", (e) => {
 
 function connect() {
   rfb = new RFB(document.getElementById("screen"), cockpitVncSocket());
+  // A reconnect builds a new canvas, so the remembered pointer position belongs
+  // to an element that no longer exists — drop it and re-centre on first use.
+  cursor.placed = false;
   applyViewportMode();
   rfb.resizeSession = false;
   rfb.qualityLevel = 8;
@@ -359,8 +379,187 @@ try {
     .observe(window.parent.document.documentElement, { attributes: true, attributeFilter: ["class"] });
 } catch (e) { /* ignore */ }
 
-// Mobile toolbar (bottom-right, semi-transparent): Fit⇄1:1 mode, fullscreen, on-screen
-// keyboard. All within the pinned FHD (resizeSession=false). Doesn't get in the way on desktop.
+// ---------------------------------------------------------------------------
+// Trackpad pointer mode.
+//
+// The pointer is driven by dispatching ordinary MouseEvents at noVNC's canvas
+// rather than by calling into RFB. That is deliberate: the mouse path is the
+// public, decade-stable surface (mousedown/mouseup/mousemove/wheel with
+// clientX/clientY), it already does the client -> element -> remote coordinate
+// conversion, and it costs nothing — noVNC never checks isTrusted.
+//
+// The visible pointer comes free. noVNC's Cursor draws the REAL remote cursor
+// image — I-beam over text, resize arrows over an edge — and on a touch device
+// it draws it as a positioned overlay instead of a CSS cursor (`useFallback =
+// !supportsCursorURIs || isTouchDevice`), precisely because a touch screen has
+// no hover to attach a CSS cursor to. That overlay follows mousemove on the
+// canvas, so our synthetic moves carry it along with no extra code and no
+// second cursor of our own invention.
+const trackpad = createTrackpad();
+let longPressTimer = null;
+
+// Where the pointer is, in CLIENT pixels, kept fractional. Fractional matters:
+// in fit mode the canvas is scaled, so a whole client pixel is several remote
+// pixels, and rounding here would make the pointer step across the desktop in
+// visible jumps at exactly the moment precision is wanted.
+const cursor = { x: 0, y: 0, placed: false };
+
+function canvasEl() { return screenEl.querySelector("canvas"); }
+
+// DOM numbers the buttons TWICE, and differently. `button` counts them
+// 0 left / 1 middle / 2 right, while the `buttons` bitmask is
+// 1 left / 2 right / 4 middle — middle and right swap places. Deriving one from
+// the other with 1 << button silently trades a right click for a middle click.
+// It matters which one is filled in: noVNC 1.5 reads `button` and the event
+// type, 1.6 rewrote mouse handling to read `buttons` (RFB._convertButtonMask).
+// The Pi ships 1.6, other boxes ship 1.5, so both are filled in correctly rather
+// than picking whichever the local copy happens to consult.
+const BUTTONS_BIT = [1, 4, 2];
+
+function dispatchMouse(type, button, held) {
+  const c = canvasEl();
+  if (!c) return;
+  c.dispatchEvent(new MouseEvent(type, {
+    bubbles: true, cancelable: true, view: window,
+    clientX: cursor.x, clientY: cursor.y,
+    button: button || 0,
+    buttons: held === null || held === undefined ? 0 : (BUTTONS_BIT[held] || 0),
+  }));
+}
+
+// Put the pointer somewhere sane the first time the mode is used, and whenever
+// the canvas has been replaced by a reconnect.
+function placeCursor() {
+  const c = canvasEl();
+  if (!c) return false;
+  const r = c.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return false;
+  if (!cursor.placed) {
+    cursor.x = r.left + r.width / 2;
+    cursor.y = r.top + r.height / 2;
+    cursor.placed = true;
+    dispatchMouse("mousemove");
+  }
+  return true;
+}
+
+function moveCursor(dx, dy, held) {
+  const c = canvasEl();
+  if (!c) return;
+  const r = c.getBoundingClientRect();
+  // Half a pixel of inset: exactly on the edge, elementFromPoint can return the
+  // element behind the canvas and noVNC's Cursor would blink out at the border.
+  const minX = r.left + 0.5, maxX = r.right - 0.5;
+  const minY = r.top + 0.5, maxY = r.bottom - 0.5;
+
+  let x = cursor.x + dx, y = cursor.y + dy;
+  const overX = x > maxX ? x - maxX : (x < minX ? x - minX : 0);
+  const overY = y > maxY ? y - maxY : (y < minY ? y - minY : 0);
+  cursor.x = Math.min(maxX, Math.max(minX, x));
+  cursor.y = Math.min(maxY, Math.max(minY, y));
+
+  // Pushing against the edge while the viewport is clipped scrolls the desktop
+  // under the pointer, the way a real screen edge does. Without this, actual-size
+  // mode plus trackpad could only ever reach the visible third of a 1080p desktop.
+  // _display is private API; if a future noVNC drops it the pointer simply stops
+  // at the edge, which is a limitation rather than a breakage — hence the guard
+  // instead of a hard dependency.
+  if ((overX || overY) && rfb && rfb.clipViewport) {
+    try { rfb._display.viewportChangePos(overX, overY); } catch (e) { /* clamp only */ }
+  }
+
+  dispatchMouse("mousemove", 0, held);
+}
+
+function runIntents(list) {
+  for (const it of list) {
+    switch (it.t) {
+      case "move":
+        moveCursor(it.dx, it.dy, trackpad.holding);
+        break;
+      case "down":
+        dispatchMouse("mousedown", it.button, it.button);
+        break;
+      case "up":
+        // The button is already released by the time this runs, so `buttons`
+        // is 0 — that is what tells noVNC 1.6 the button went up.
+        dispatchMouse("mouseup", it.button, null);
+        break;
+      case "click":
+        dispatchMouse("mousedown", it.button, it.button);
+        dispatchMouse("mouseup", it.button, null);
+        break;
+      case "scroll": {
+        const c = canvasEl();
+        if (!c) break;
+        // Sign follows the touch-screen convention, and noVNC's own two-finger
+        // gesture: fingers move down -> content follows -> that is a scroll UP.
+        c.dispatchEvent(new WheelEvent("wheel", {
+          bubbles: true, cancelable: true, view: window,
+          clientX: cursor.x, clientY: cursor.y,
+          deltaX: -it.dx, deltaY: -it.dy, deltaMode: 0,
+        }));
+        break;
+      }
+    }
+  }
+}
+
+function armLongPress() {
+  clearTimeout(longPressTimer);
+  longPressTimer = setTimeout(() => runIntents(trackpad.tick(Date.now())), LONG_PRESS_MS + 20);
+}
+
+function points(ev) {
+  return Array.from(ev.touches, (t) => ({ id: t.identifier, x: t.clientX, y: t.clientY }));
+}
+
+// Bound on `document`, in the capture phase, for two independent reasons.
+// Capture: noVNC's GestureHandler listens on the canvas itself, and a capture
+// listener on an ancestor runs first, so stopPropagation here is what keeps the
+// two modes from both firing. Document rather than #screen: noVNC's setCapture
+// drops a full-screen proxy element into document.body for the duration of a
+// button press, and a listener anchored inside #screen would stop seeing the
+// finger the moment a drag started.
+function handleTouch(ev) {
+  if (pointerMode !== "trackpad" || !rfb) return;
+  // The toolbar and the hidden keyboard input are ordinary UI and must keep
+  // their taps.
+  if (ev.target && ev.target.closest && ev.target.closest("#ad-desktop-toolbar")) return;
+  if (!placeCursor()) return;
+
+  ev.preventDefault();
+  ev.stopPropagation();
+
+  const now = Date.now();
+  const pts = points(ev);
+  if (ev.type === "touchstart") { runIntents(trackpad.touchStart(pts, now)); armLongPress(); }
+  else if (ev.type === "touchmove") runIntents(trackpad.touchMove(pts, now));
+  else if (ev.type === "touchend") { runIntents(trackpad.touchEnd(pts, now)); if (!trackpad.active) clearTimeout(longPressTimer); }
+  else { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); }
+}
+// passive:false is required — a passive listener may not preventDefault, and
+// without preventDefault the browser scrolls/zooms the page under the desktop.
+for (const t of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
+  document.addEventListener(t, handleTouch, { capture: true, passive: false });
+}
+// A button held when the window goes away would stay held on the remote side.
+window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); });
+
+function setPointerMode(mode) {
+  if (mode === pointerMode) return;
+  runIntents(trackpad.cancel());
+  clearTimeout(longPressTimer);
+  pointerMode = mode;
+  cursor.placed = false;
+  applyViewportMode(); // dragViewport depends on the pointer mode
+  if (pointerMode === "trackpad") placeCursor();
+  try { localStorage.setItem("ad-desktop-pointer", pointerMode); } catch (e) { /* ignore */ }
+}
+
+// Mobile toolbar (bottom-right, semi-transparent): pointer mode, Fit⇄1:1 mode, fullscreen,
+// on-screen keyboard. All within the pinned FHD (resizeSession=false). Doesn't get in the way
+// on desktop.
 (function mobileToolbar() {
   // A hidden input raises the phone's soft keyboard and forwards typing to VNC. noVNC has no
   // soft keyboard of its own; beforeinput gives inserted text/Backspace/Enter more reliably than
@@ -411,6 +610,17 @@ try {
     zoomOut: svg('<circle cx="10" cy="10" r="7"/><path d="M21 21l-5.2-5.2M7 10h6"/>'),          // pan -> fit whole
     fullscreen: svg('<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>'),
     keyboard: svg('<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h0M10 10h0M14 10h0M18 10h0M8 14h8"/>'),
+    // A touchpad with a pointer on it: the screen is a pad, the arrow is what moves.
+    // The arrow is drawn at full size inside a scaled group, with stroke-width
+    // scaled back up by the same factor so it doesn't turn into a hairline.
+    trackpad: svg('<rect x="2" y="4.5" width="20" height="15" rx="2.5"/>' +
+      '<g transform="translate(8.4 7.6) scale(0.30)" stroke-width="6.5">' +
+      '<path d="M1 1l16 6.4-6.8 1.8-1.8 6.8z"/></g>'),
+    // A hand about to tap, with the point it lands on: what you touch is what you hit.
+    directTouch: svg('<circle cx="8" cy="1.9" r=".8"/>' +
+      '<path d="M10 9.5V4.6a2 2 0 0 0-4 0V14"/><path d="M14 10.2V9.4a2 2 0 0 0-4 0v.8"/>' +
+      '<path d="M18 11v-1a2 2 0 0 0-4 0v1"/>' +
+      '<path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.9-6-2.3l-3.6-3.6a2 2 0 0 1 2.8-2.8L7 15"/>'),
   };
 
   const fitBtn = mkBtn(ICON.zoomIn, "", () => { panMode = !panMode; applyViewportMode(); refreshFit(); setTimeout(updateFrame, 150); });
@@ -435,6 +645,26 @@ try {
                   (window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
   const kbBtn = mkBtn(ICON.keyboard, "Keyboard", () => { kbInput.focus(); });
 
+  // Pointer mode, touch only: with a real mouse the direct path is already
+  // relative pointing with a visible cursor, so the toggle would be noise.
+  // Like the fit button, this one shows the mode it will SWITCH TO, not the one
+  // in force — the tooltip says so out loud, since a mode button can be read
+  // either way.
+  const ptrBtn = mkBtn(ICON.trackpad, "", () => {
+    setPointerMode(pointerMode === "trackpad" ? "touch" : "trackpad");
+    refreshPtr();
+  });
+  function refreshPtr() {
+    const toTrackpad = pointerMode !== "trackpad";
+    ptrBtn.innerHTML = toTrackpad ? ICON.trackpad : ICON.directTouch;
+    const title = toTrackpad
+      ? "Trackpad — slide to move the pointer, tap to click"
+      : "Direct touch — tap where you want to click";
+    ptrBtn.title = title;
+    ptrBtn.setAttribute("aria-label", title);
+  }
+  refreshPtr();
+
   const bar = document.createElement("div");
   bar.id = "ad-desktop-toolbar";
   bar.style.cssText =
@@ -445,7 +675,7 @@ try {
   bar.addEventListener("pointerleave", dim);
   bar.addEventListener("pointerdown", wake);
   bar.append(fitBtn, fsBtn);
-  if (isTouch) bar.append(kbBtn);
+  if (isTouch) bar.append(ptrBtn, kbBtn);
   document.body.appendChild(bar);
 })();
 

@@ -4,6 +4,9 @@
   "description": "Cockpit on Raspberry Pi OS: a desktop tab over noVNC, a file browser, VM/container management and honest branding",
   "type": "module",
   "private": true,
-  "scripts": { "test": "node --test test/*.test.js" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:browser": "test/browser/run.sh"
+  },
   "license": "MIT"
 }

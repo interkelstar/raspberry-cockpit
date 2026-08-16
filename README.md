@@ -41,6 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/interkelstar/raspberry-cockpit/mast
 | | |
 |---|---|
 | **Desktop** | the machine's own graphical session in a Cockpit tab, over noVNC |
+| **Trackpad mode** | on a phone, the screen becomes a touchpad with a visible pointer |
 | **File browser** | upload, download, browse — `cockpit-files`, which Debian doesn't package |
 | **Virtual machines** | `cockpit-machines`: create, console, start/stop |
 | **Containers** | `cockpit-podman`, wired to the rootless podman socket |
@@ -59,6 +60,21 @@ cockpit.channel({ payload: "stream", address: "127.0.0.1", port: vncPort, binary
 Browser → `cockpit-ws` → stream channel → local VNC. Cockpit already authenticated the user through PAM, so **the VNC server runs with no authentication, bound to localhost only** — there is no route to it from outside, and nothing to log into twice.
 
 A useful side effect: the plugin contains no reference to X11, Wayland, or any particular VNC server. It opens a stream and speaks RFB; where the pixels come from is invisible to it. The installer picks the server (`wayvnc` for Wayland, `x0vncserver` for X11) by detecting the **live session**, not by reading the distribution name.
+
+## Two ways to point
+
+A 1920px desktop scaled into a phone means a fingertip covers a good part of a window's title bar. Tapping where you want to click — which is what noVNC does on its own — is fine for a button and hopeless for a close box or a scrollbar. So the toolbar has a second mode, the one Chrome Remote Desktop settled on:
+
+| | |
+|---|---|
+| **Direct touch** (hand icon) | you tap, it clicks there |
+| **Trackpad** (touchpad icon) | the screen is a touchpad; slide to push a visible pointer, tap to click wherever it is |
+
+In trackpad mode: **tap** left-click · **two-finger tap** right-click · **three-finger tap** middle-click · **two fingers sliding** scroll · **tap then touch again and slide**, or **press and hold then slide**, drag. Slow movement is geared down and fast movement geared up, so the pointer can be both precise and cross the screen — the same acceleration curve that lets a small physical trackpad drive a large display.
+
+The pointer you see is the **real remote cursor** — an I-beam over text, resize arrows on a window edge — not a dot this plugin invented. noVNC already draws the server's cursor as an overlay rather than a CSS cursor when it detects a touch device (a touch screen has no hover for a CSS cursor to attach to), so the pointer follows the synthetic mouse moves for free.
+
+The choice persists, and the button only appears on touch devices: with a real mouse you already have relative pointing and a visible cursor.
 
 ## What this does NOT do
 
@@ -80,6 +96,8 @@ Raspberry Pi 4B (8 GB), Debian 13 trixie, aarch64, labwc/Wayland, Cockpit 337, w
 
 End-to-end: install → `verify.sh` green → port changed 5901 → 5902 → back → `--uninstall` (leaving two unrelated `wayvnc` instances untouched) → reinstall. **The desktop tab was confirmed by eye in a browser**, which is a separate bullet on purpose — see below.
 
+Trackpad mode is covered by `npm run test:browser` down to the RFB bytes on the wire, on an emulated phone viewport with real touch input. That is strong evidence and it is still not the same as a thumb on actual glass — the feel of the acceleration curve, in particular, is a judgement no assertion makes.
+
 ## Things that cost real time
 
 Every one of these presents the same way: the installer reports success, the checks are green, and the tab is blank. None of them is visible from the server side.
@@ -89,6 +107,10 @@ Every one of these presents the same way: the installer reports success, the che
 **`Object.defineProperty` defaults to `enumerable: false`, and `Websock.attach()` validates the socket with `Object.keys()`.** Accessor properties exist and work perfectly, yet are invisible to that check: the RFB constructor throws `Raw channel missing property: onmessage` before any canvas exists — and the console stays *silent*, because the exception is swallowed by a promise.
 
 **Open must not be delivered synchronously from a setter.** `attach()` assigns `onmessage`, then `onopen`, then `onclose`/`onerror`. A synchronous delivery starts the handshake mid-`attach()`, on a half-assembled socket, and the next state arrives at the wrong moment: `Unexpected server connection while connecting`. A real WebSocket never fires `onopen` from an assignment; hence `queueMicrotask`.
+
+**DOM numbers the mouse buttons twice, and differently.** `MouseEvent.button` counts 0 left / 1 middle / 2 right; the `buttons` bitmask is 1 left / 2 right / 4 middle — middle and right swap places. Deriving one from the other with `1 << button` looks obviously right and silently turns every right click into a middle click. Worse, *which field is read* depends on the noVNC version: 1.5 reads `button` plus the event type, 1.6 rewrote mouse handling around `buttons` (`RFB._convertButtonMask`). A synthetic event has to fill in both, correctly. Nothing on the browser side reports this — the click is delivered, just as the wrong button.
+
+**A tap window measured from the first finger is not a tap window.** A two-finger tap needs time for the second finger to land, be noticed, and lift; a quarter of a second is not enough and the right click simply never arrives. The threshold is now the long-press timeout, which is also the only value that cannot conflict with it.
 
 **`wayvnc` without `--config` reads `~/.config/wayvnc/config`** — someone else's file. On the test board it began with `[wayvnc]`, and this parser has no sections: `Failed to load config. Error on line 1`.
 
@@ -113,10 +135,15 @@ Note the origin must match **exactly, including the port**. A box configured for
 ## Tests
 
 ```
-npm test        # node --test, no dependencies
+npm test                # node --test, no dependencies, ~0.2s
+npm run test:browser    # real touch input through real chromium, ~30s
 ```
 
-Covers the config parsing (`desktop/config.js`), which is a separate module precisely so it can be tested — `app.js` touches the DOM and noVNC on import and won't load under node. Two of the tests are regression locks on the `^…$` anchors: without them a commented-out `#port=9999` would count as a setting. The locks were checked for their ability to fail — removing the anchors reddens exactly those two and leaves the other seven green.
+`npm test` covers the two modules that hold decisions rather than DOM calls, and are separate files precisely so they can be tested: `desktop/config.js` (parsing) and `desktop/trackpad.js` (what counts as a tap, when a touch becomes a drag, how far the pointer travels per finger-pixel). `app.js` touches the DOM and noVNC on import and won't load under node.
+
+Several tests are regression locks, and each was checked for its **ability to fail** — the fix removed, the suite run, exactly the expected test red. Two of them did not fail, which is how it came out that treating a hand-off between fingers as movement drops half of all right clicks: whichever finger leaves first is a coin toss.
+
+`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. It found a right click arriving as a middle click, and a two-finger tap being silently dropped.
 
 ## A note on verification
 
