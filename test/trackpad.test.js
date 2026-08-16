@@ -77,9 +77,33 @@ test("tap, then touch again and slide: the button is held for the whole drag", (
     const t = createTrackpad();
     t.touchStart([p(1, 100, 100)], 0);
     t.touchEnd([], 50);                                    // tap
-    assert.deepEqual(t.touchStart([p(2, 100, 100)], 100), [{ t: "down", button: 0 }]);
-    assert.deepEqual(types(t.touchMove([p(2, 160, 100)], 150)), ["move"]);
+    // Armed, NOT pressed — landing must not commit to a button yet.
+    assert.deepEqual(t.touchStart([p(2, 100, 100)], 100), []);
+    // The press arrives with the first movement, and BEFORE it.
+    assert.deepEqual(types(t.touchMove([p(2, 160, 100)], 150)), ["down", "move"]);
+    assert.deepEqual(types(t.touchMove([p(2, 200, 100)], 180)), ["move"]);
     assert.deepEqual(t.touchEnd([], 200), [{ t: "up", button: 0 }]);
+});
+
+// Reported from a phone as "right click just doesn't work in this mode". People
+// tap in quick succession, so a tap followed by a two-finger tap is ordinary —
+// and pressing on landing turned the intended right click into a left one.
+test("a tap followed straight away by a two-finger tap is still a right click", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchEnd([], 50);                                    // tap
+    t.touchStart([p(2, 100, 100)], 100);                   // inside the arm window
+    t.touchStart([p(2, 100, 100), p(3, 140, 100)], 120);
+    t.touchEnd([p(3, 140, 100)], 200);
+    assert.deepEqual(t.touchEnd([], 210), [{ t: "click", button: 2 }]);
+});
+
+test("a plain double tap is two clicks, with no stray press between them", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    assert.deepEqual(t.touchEnd([], 50), [{ t: "click", button: 0 }]);
+    t.touchStart([p(2, 100, 100)], 120);
+    assert.deepEqual(t.touchEnd([], 170), [{ t: "click", button: 0 }]);
 });
 
 test("touching again too late is an ordinary touch, not a drag", () => {
@@ -134,6 +158,86 @@ test("scroll is reported as travel since the last move, not since the start", ()
     t.touchMove([p(1, 100, 120), p(2, 140, 120)], 20);
     const second = t.touchMove([p(1, 100, 135), p(2, 140, 135)], 30);
     assert.equal(second[0].dy, 15);
+});
+
+// --- pinch -----------------------------------------------------------------
+
+function twoDown(t, a, b, at = 10) {
+    t.touchStart([a], 0);
+    t.touchStart([a, b], at);
+    return t;
+}
+
+test("two fingers spreading apart zoom in", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    const out = t.touchMove([p(1, 60, 100), p(2, 240, 100)], 30);
+    assert.deepEqual(types(out), ["zoom"]);
+    assert.ok(out[0].factor > 1, `factor ${out[0].factor}`);
+    assert.equal(out[0].cx, 150);            // the midpoint, held still
+});
+
+test("two fingers closing zoom out", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    const out = t.touchMove([p(1, 140, 100), p(2, 160, 100)], 30);
+    assert.deepEqual(types(out), ["zoom"]);
+    assert.ok(out[0].factor < 1, `factor ${out[0].factor}`);
+});
+
+test("zoom is reported per move, not cumulatively", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    t.touchMove([p(1, 50, 100), p(2, 250, 100)], 30);      // gap 100 -> 200
+    const second = t.touchMove([p(1, 0, 100), p(2, 300, 100)], 60); // 200 -> 300
+    assert.ok(Math.abs(second[0].factor - 1.5) < 1e-9, `factor ${second[0].factor}`);
+});
+
+// A pinch is never perfectly symmetric and a scroll is never perfectly parallel.
+// Whichever changed more decides, ONCE — re-deciding per frame makes a slightly
+// diagonal pinch flicker between zooming and scrolling.
+test("fingers moving together scroll, and keep scrolling as the gap wobbles", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    assert.deepEqual(types(t.touchMove([p(1, 100, 140), p(2, 200, 140)], 30)), ["scroll"]);
+    assert.deepEqual(types(t.touchMove([p(1, 95, 180), p(2, 210, 180)], 60)), ["scroll"]);
+});
+
+test("a gesture that started as a pinch stays a pinch, however far it then travels", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    assert.deepEqual(types(t.touchMove([p(1, 50, 100), p(2, 250, 100)], 30)), ["zoom"]);
+    // Measured from the start the midpoint has now moved much further than the
+    // gap did. Deciding again here would flip a pinch mid-gesture into a scroll
+    // — the fingers must keep dragging the image, not start scrolling an app.
+    const drift = t.touchMove([p(1, 50, 400), p(2, 250, 400)], 60);
+    assert.deepEqual(types(drift), ["pan"]);
+    assert.equal(drift[0].dy, 300);
+});
+
+// A zoomed-in view has no other gesture that moves it: two-finger drag is a
+// scroll wheel and belongs to whatever app has focus.
+test("fingers that pinch and travel at once both zoom and pan", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    const out = t.touchMove([p(1, 80, 140), p(2, 260, 140)], 30);
+    assert.deepEqual(types(out), ["zoom", "pan"]);
+    assert.ok(out[0].factor > 1);
+    assert.equal(out[1].dy, 40);
+});
+
+// A second finger cancels a pending tap-tap-drag. Without that the press is
+// still owed, and it lands on whichever finger is left after the other lifts —
+// a button going down in the middle of a two-finger gesture.
+test("a second finger cancels a pending tap-tap-drag", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchEnd([], 50);                                    // tap: arms
+    t.touchStart([p(2, 100, 100)], 100);
+    t.touchStart([p(2, 100, 100), p(3, 200, 100)], 120);   // disarms
+    t.touchEnd([p(3, 200, 100)], 160);                     // the tracked finger leaves
+    assert.deepEqual(types(t.touchMove([p(3, 260, 100)], 200)), ["move"]);
+});
+
+test("a pinch is not a tap and produces no click", () => {
+    const t = twoDown(createTrackpad(), p(1, 100, 100), p(2, 200, 100));
+    t.touchMove([p(1, 50, 100), p(2, 250, 100)], 30);
+    t.touchEnd([p(2, 250, 100)], 60);
+    assert.deepEqual(t.touchEnd([], 70), []);
 });
 
 test("cancel releases a held button", () => {

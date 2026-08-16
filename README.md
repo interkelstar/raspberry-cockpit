@@ -72,6 +72,8 @@ A 1920px desktop scaled into a phone means a fingertip covers a good part of a w
 
 In trackpad mode: **tap** left-click · **two-finger tap** right-click · **three-finger tap** middle-click · **two fingers sliding** scroll · **tap then touch again and slide**, or **press and hold then slide**, drag. Slow movement is geared down and fast movement geared up, so the pointer can be both precise and cross the screen — the same acceleration curve that lets a small physical trackpad drive a large display.
 
+**Pinch zooms**, in either mode: spreading two fingers leaves "fit" and magnifies from exactly what you were looking at, pinching back below the fit scale returns to fit. While pinching, the fingers also drag the view, because otherwise a zoomed-in desktop would have no gesture that pans it — two-finger drag is a scroll wheel and belongs to whichever app has focus. The 🔍+ / 🔍− button remains the way back to a known scale: actual pixels, or the whole screen.
+
 The pointer you see is the **real remote cursor** — an I-beam over text, resize arrows on a window edge — not a dot this plugin invented. noVNC already draws the server's cursor as an overlay rather than a CSS cursor when it detects a touch device (a touch screen has no hover for a CSS cursor to attach to), so the pointer follows the synthetic mouse moves for free.
 
 The choice persists, and the button only appears on touch devices: with a real mouse you already have relative pointing and a visible cursor.
@@ -110,6 +112,12 @@ Every one of these presents the same way: the installer reports success, the che
 
 **DOM numbers the mouse buttons twice, and differently.** `MouseEvent.button` counts 0 left / 1 middle / 2 right; the `buttons` bitmask is 1 left / 2 right / 4 middle — middle and right swap places. Deriving one from the other with `1 << button` looks obviously right and silently turns every right click into a middle click. Worse, *which field is read* depends on the noVNC version: 1.5 reads `button` plus the event type, 1.6 rewrote mouse handling around `buttons` (`RFB._convertButtonMask`). A synthetic event has to fill in both, correctly. Nothing on the browser side reports this — the click is delivered, just as the wrong button.
 
+**noVNC grabs the pointer with a full-screen transparent div, and only a `mouseup` seen at window level lets it go.** `setCapture` drops `#noVNC_mouse_capture_elem` (z-index 10000) over the whole page on every mousedown. A synthetic mouseup dispatched at the canvas never reaches window: noVNC's own handler calls `stopPropagation` on it. So after the first tap the div stays, invisible, over everything — and every toolbar button under it is dead, with no error and nothing to see. The fix is to call the exported `releaseCapture()` after each synthetic release. The lesson generalises: **synthesising input means inheriting the side effects the real thing would have undone.**
+
+Related, and the reason the scoping test is geometric: deciding "is this touch mine?" from `ev.target` is wrong whenever a transparent overlay exists, because the target is the overlay and the user is touching what they see. Comparing coordinates against rectangles cannot be fooled that way.
+
+**Pressing the button when the finger lands is not the same as arming a drag.** A tap that arms the next touch, and presses immediately on it, turns an ordinary tap-then-two-finger-tap into a *left* click — reported from a phone as "right click just doesn't work". Arming must wait for actual movement before it commits to a button.
+
 **A tap window measured from the first finger is not a tap window.** A two-finger tap needs time for the second finger to land, be noticed, and lift; a quarter of a second is not enough and the right click simply never arrives. The threshold is now the long-press timeout, which is also the only value that cannot conflict with it.
 
 **`wayvnc` without `--config` reads `~/.config/wayvnc/config`** — someone else's file. On the test board it began with `[wayvnc]`, and this parser has no sections: `Failed to load config. Error on line 1`.
@@ -141,9 +149,9 @@ npm run test:browser    # real touch input through real chromium, ~30s
 
 `npm test` covers the two modules that hold decisions rather than DOM calls, and are separate files precisely so they can be tested: `desktop/config.js` (parsing) and `desktop/trackpad.js` (what counts as a tap, when a touch becomes a drag, how far the pointer travels per finger-pixel). `app.js` touches the DOM and noVNC on import and won't load under node.
 
-Several tests are regression locks, and each was checked for its **ability to fail** — the fix removed, the suite run, exactly the expected test red. Two of them did not fail, which is how it came out that treating a hand-off between fingers as movement drops half of all right clicks: whichever finger leaves first is a coin toss.
+40 tests. Several are regression locks, and each was checked for its **ability to fail** — the fix removed, the suite run, exactly the expected test red. Two of them did not fail, which is how it came out that treating a hand-off between fingers as movement drops half of all right clicks: whichever finger leaves first is a coin toss.
 
-`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. It found a right click arriving as a middle click, and a two-finger tap being silently dropped.
+`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. 18 checks. It found a right click arriving as a middle click, a two-finger tap being silently dropped, and a stray pointer grab that killed the toolbar.
 
 ## A note on verification
 

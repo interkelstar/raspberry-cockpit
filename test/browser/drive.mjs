@@ -208,6 +208,42 @@ check("two fingers scroll (noVNC wheel buttons 4/5)",
       scroll.some((m) => m.mask === 8 || m.mask === 16),
       JSON.stringify([...new Set(scroll.map((m) => m.mask))]));
 
+// The toolbar must survive using the trackpad. noVNC grabs the pointer on
+// mousedown with a full-screen transparent div; if that grab is never released
+// the div sits over everything and every button under it is silently dead.
+await settle();
+const toolbar = await evaluate(`(() => {
+  window.__btnClicks = 0;
+  window.__btn = [...document.querySelectorAll('#ad-desktop-toolbar button')].find(b => /Fullscreen/.test(b.title));
+  window.__btn.addEventListener("click", () => window.__btnClicks++);
+  const b = window.__btn.getBoundingClientRect();
+  return { x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) };
+})()`);
+await burst([["touchStart", [{ id: 1, ...toolbar }]], ["touchEnd", []]]);
+await sleep(300);
+const overlay = await evaluate(`(() => { const p = document.getElementById("noVNC_mouse_capture_elem"); return p ? getComputedStyle(p).display : "absent"; })()`);
+check("the toolbar still works after using the trackpad",
+      (await evaluate("window.__btnClicks")) === 1,
+      `clicks=${await evaluate("window.__btnClicks")}, noVNC capture overlay=${overlay}`);
+
+// Pinch. In fit mode the desktop is scaled down to fit; spreading two fingers
+// must magnify it. The scale is read off the DOM — rendered width vs
+// framebuffer width — rather than out of noVNC's internals.
+const scaleProbe = `(() => { const c = document.querySelector('#screen canvas'); return c ? c.getBoundingClientRect().width / c.width : 0; })()`;
+await settle();
+const scale0 = await evaluate(scaleProbe);
+await burst([
+  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }]],
+  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x + 40, y: mid.y }]],
+  ["touchMove", [{ id: 1, x: mid.x - 90, y: mid.y }, { id: 2, x: mid.x + 90, y: mid.y }]],
+  ["touchMove", [{ id: 1, x: mid.x - 140, y: mid.y }, { id: 2, x: mid.x + 140, y: mid.y }]],
+  ["touchEnd", [{ id: 2, x: mid.x + 140, y: mid.y }]],
+  ["touchEnd", []],
+]);
+await sleep(400);
+const scale1 = await evaluate(scaleProbe);
+check("pinching out zooms in", scale1 > scale0 * 1.15, `scale ${scale0.toFixed(3)} -> ${scale1.toFixed(3)}`);
+
 // The visible pointer: noVNC's own cursor overlay must be there and following.
 const cur = await evaluate(`(() => {
   const cs = [...document.body.children].filter(e => e.tagName === 'CANVAS' && e.style.position === 'fixed');

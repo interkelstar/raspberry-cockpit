@@ -14,6 +14,8 @@
 //   {t: "up",     button}      release
 //   {t: "click",  button}      press and release at the current position
 //   {t: "scroll", dx, dy}      finger travel, in finger pixels, sign as on a touch screen
+//   {t: "zoom",   factor, cx, cy}   pinch: scale by factor about the point between the fingers
+//   {t: "pan",    dx, dy}      pinch: the fingers also dragged the image this far
 //
 // Button numbers follow the DOM: 0 left, 1 middle, 2 right.
 
@@ -31,12 +33,23 @@
 export const TAP_MAX_MS = 500;
 export const TAP_SLOP = 12;
 
-// Touching down again this soon after a tap holds the button instead of just
-// moving: the tap-tap-drag every trackpad has. It also makes an ordinary
-// double-tap work for free — tap one delivers a click, tap two presses and
-// releases, and the remote side sees two clicks close enough together to be a
-// double-click by its own rules rather than ours.
+// Touching down again this soon after a tap ARMS the tap-tap-drag every trackpad
+// has. Armed is not pressed: the button goes down when the finger actually
+// starts moving, not when it lands.
+//
+// Pressing on landing is the obvious implementation and it is wrong twice over.
+// People tap in quick succession, so a tap followed by a two-finger tap is
+// ordinary — and pressing immediately turns that intended RIGHT click into a
+// left one, which reads as "right click just doesn't work in this mode". It
+// also puts a stray press-release around every plain double tap.
 export const DRAG_ARM_MS = 300;
+
+// How much the gap between two fingers must change before the gesture is a
+// pinch rather than a two-finger scroll. Whichever moved further — the gap or
+// the midpoint — wins, and the decision is made ONCE per gesture: re-deciding
+// every frame makes a slightly diagonal pinch flicker between zooming and
+// scrolling.
+export const PINCH_SLOP = 8;
 
 // Holding still this long presses the button without a preceding tap. This is
 // the discoverable way to drag: put a finger down on a window title bar, wait,
@@ -74,6 +87,10 @@ function find(points, id) {
     return null;
 }
 
+function spread(points) {
+    return Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+}
+
 export function createTrackpad() {
     // primaryId is the finger the pointer follows. It is pinned at the first
     // touchstart and never re-picked: following "points[0]" instead would make
@@ -86,11 +103,16 @@ export function createTrackpad() {
     let maxFingers = 0;      // how many were down at once: picks the button
     let scrollFrom = null;   // centroid baseline while two fingers are down
     let held = null;         // button currently held, or null
+    let armed = false;       // a tap-tap-drag is pending: press once it moves
     let lastTapAt = null;    // end of the previous tap, for DRAG_ARM_MS
+    let twoMode = null;      // once two fingers are down: null | "scroll" | "pinch"
+    let twoFrom = null;      // spread + centroid when the second finger landed
+    let prevSpread = 0;
 
     function reset() {
         primaryId = null; last = null; start = null;
         moved = false; maxFingers = 0; scrollFrom = null;
+        armed = false; twoMode = null; twoFrom = null;
     }
 
     // maxFingers rather than the current count, because fingers rarely land or
@@ -115,13 +137,19 @@ export function createTrackpad() {
                 moved = false;
 
                 if (held === null && lastTapAt !== null && (now - lastTapAt) <= DRAG_ARM_MS) {
-                    held = 0;
-                    out.push({ t: "down", button: 0 });
+                    armed = true;
                 }
                 lastTapAt = null;
             }
 
-            if (points.length >= 2) scrollFrom = centroid(points);
+            if (points.length >= 2) {
+                // A second finger means this was never a tap-tap-drag.
+                armed = false;
+                scrollFrom = centroid(points);
+                prevSpread = spread(points);
+                twoFrom = { spread: prevSpread, c: scrollFrom };
+                twoMode = null;
+            }
             return out;
         },
 
@@ -130,16 +158,40 @@ export function createTrackpad() {
             if (primaryId === null) return out;
 
             if (points.length >= 2) {
-                // Two fingers scroll; the pointer stays where it is. The baseline
-                // is re-set on every move so a finger joining or leaving mid-scroll
-                // shifts the centroid without that shift being read as travel.
+                // Two fingers either scroll or pinch; the pointer stays where it
+                // is either way. The baselines are re-set on every move so a
+                // finger joining or leaving mid-gesture shifts the centroid
+                // without that shift being read as travel.
                 const c = centroid(points);
-                if (scrollFrom) {
+                const d = spread(points);
+                moved = true;
+
+                if (twoMode === null && twoFrom) {
+                    const dGap = Math.abs(d - twoFrom.spread);
+                    const dMid = Math.hypot(c.x - twoFrom.c.x, c.y - twoFrom.c.y);
+                    if (dGap > PINCH_SLOP && dGap > dMid) twoMode = "pinch";
+                    else if (dMid > TAP_SLOP) twoMode = "scroll";
+                }
+
+                if (twoMode === "pinch") {
+                    if (prevSpread > 0 && d > 0 && d !== prevSpread) {
+                        out.push({ t: "zoom", factor: d / prevSpread, cx: c.x, cy: c.y });
+                    }
+                    // Once the fingers are on the image they move it, the way
+                    // they do on any map. Without this, a zoomed-in view has no
+                    // gesture that pans it at all: two-finger drag is a scroll
+                    // wheel and belongs to whatever app has focus.
+                    if (scrollFrom) {
+                        const dx = c.x - scrollFrom.x, dy = c.y - scrollFrom.y;
+                        if (dx || dy) out.push({ t: "pan", dx, dy });
+                    }
+                } else if (twoMode === "scroll" && scrollFrom) {
                     const dx = c.x - scrollFrom.x, dy = c.y - scrollFrom.y;
                     if (dx || dy) out.push({ t: "scroll", dx, dy });
                 }
+
                 scrollFrom = c;
-                moved = true;
+                prevSpread = d;
                 return out;
             }
 
@@ -152,6 +204,16 @@ export function createTrackpad() {
             last = { x: p.x, y: p.y, at: now };
 
             if (!moved && Math.hypot(p.x - start.x, p.y - start.y) > TAP_SLOP) moved = true;
+
+            // The press of a tap-tap-drag happens HERE, on the first real
+            // movement — see DRAG_ARM_MS. It must precede the move, or the drag
+            // starts one step behind the finger.
+            if (armed && held === null && (dx || dy)) {
+                armed = false;
+                held = 0;
+                out.push({ t: "down", button: 0 });
+            }
+
             if (dx || dy) out.push({ t: "move", dx: dx * gain, dy: dy * gain });
             return out;
         },
@@ -162,7 +224,10 @@ export function createTrackpad() {
             if (primaryId === null) return out;
 
             if (points.length > 0) {
-                if (points.length >= 2) scrollFrom = centroid(points);
+                if (points.length >= 2) {
+                    scrollFrom = centroid(points);
+                    prevSpread = spread(points);
+                }
                 // The primary finger left while others remain: hand the pointer
                 // to one that is still down rather than freezing it. `moved` is
                 // deliberately left alone. Marking the hand-off as movement looks
@@ -205,6 +270,7 @@ export function createTrackpad() {
             if ((now - start.at) < LONG_PRESS_MS) return [];
             if (maxFingers > 1) return [];
             held = 0;
+            armed = false;
             return [{ t: "down", button: 0 }];
         },
 
@@ -217,6 +283,9 @@ export function createTrackpad() {
             reset();
             return out;
         },
+
+        // For the caller's benefit only — the recogniser never reads it.
+        get twoFingerMode() { return twoMode; },
 
         get active() { return primaryId !== null; },
         get holding() { return held; },

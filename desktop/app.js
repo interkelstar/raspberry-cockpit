@@ -5,6 +5,13 @@ import { readPort, DEFAULT_PORT } from "./config.js";
 // Same reason again: the gesture recognition is where the decisions are, so it
 // lives apart from the DOM and is unit-tested.
 import { createTrackpad, LONG_PRESS_MS } from "./trackpad.js";
+// noVNC grabs the pointer on mousedown by dropping a FULL-SCREEN transparent
+// div (#noVNC_mouse_capture_elem, z-index 10000) over the page, and takes it
+// away again on a mouseup seen at window level. Our synthetic mouseup never
+// gets there: noVNC's own canvas handler calls stopPropagation on it. So the
+// div stayed, over everything, and every toolbar button below it went dead
+// after the first tap — invisibly, since the div is transparent.
+import { releaseCapture } from "./novnc/core/util/events.js";
 
 let rfb;
 
@@ -33,6 +40,81 @@ function applyViewportMode() {
   // inside noVNC's mouse handling, not its touch handling, so it would swallow
   // the synthetic press we send for a tap and turn every click into a pan.
   rfb.dragViewport = panMode && pointerMode !== "trackpad";
+  if (panMode) applyZoom();
+}
+
+// Zoom, meaningful only in pan mode: fit mode is by definition "whatever scale
+// shows all of it". 1.0 is actual pixels, which is what the toolbar button
+// gives you; pinching moves it from there. Persisted, like the mode itself.
+const MIN_ZOOM = 0.2, MAX_ZOOM = 4;
+let zoom = 1;
+try {
+  const z = parseFloat(localStorage.getItem("ad-desktop-zoom"));
+  if (z >= MIN_ZOOM && z <= MAX_ZOOM) zoom = z;
+} catch (e) { /* private mode */ }
+
+// _display is private, but Display.scale is a public property of a public class,
+// and there is no route to manual scaling through RFB: scaleViewport is
+// all-or-nothing autoscale. Assigning clipViewport again (to the value it
+// already has) is not a no-op — the setter re-runs _updateClip, which is what
+// resizes the viewport and fixes the scrollbars for the new scale.
+function applyZoom() {
+  if (!rfb) return;
+  try {
+    rfb._display.scale = zoom;
+    rfb.clipViewport = true;
+  } catch (e) { /* no scaling available — stay wherever noVNC put us */ }
+}
+
+// The scale at which the whole desktop fits. Below it, panning has nothing to
+// pan to, so that is the point where pinching in should hand back to fit mode.
+function fitScale() {
+  try {
+    const b = screenEl.getBoundingClientRect();
+    return Math.min(b.width / rfb._display.width, b.height / rfb._display.height);
+  } catch (e) { return MIN_ZOOM; }
+}
+
+let refreshFitButton = () => {};
+function setPanMode(on) {
+  if (panMode === on) return;
+  panMode = on;
+  try { localStorage.setItem("ad-desktop-pan", on ? "1" : "0"); } catch (e) { /* ignore */ }
+  applyViewportMode();
+  refreshFitButton();
+  setTimeout(updateFrame, 150);
+}
+
+function applyPinch(factor, cx, cy) {
+  if (!rfb) return;
+  const c = canvasEl();
+  if (!c) return;
+  let before;
+  try { before = rfb._display.scale; } catch (e) { return; }
+
+  // Pinching out while fitted enters zoom mode from exactly what you were
+  // looking at, rather than jumping to 1:1 first.
+  if (!panMode) {
+    if (factor <= 1) return;
+    zoom = before;
+    setPanMode(true);
+  }
+
+  const rect = c.getBoundingClientRect();
+  const target = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
+  if (target < fitScale()) { setPanMode(false); return; }
+
+  zoom = target;
+  applyZoom();
+  try { localStorage.setItem("ad-desktop-zoom", String(zoom)); } catch (e) { /* ignore */ }
+
+  // Keep the desktop pixel that was between the fingers between the fingers.
+  // Without this the view lurches toward its top-left corner on every pinch.
+  try {
+    const after = rfb._display.scale;
+    const k = (1 / before) - (1 / after);
+    rfb._display.viewportChangePos((cx - rect.left) * k, (cy - rect.top) * k);
+  } catch (e) { /* anchoring is a nicety, not a requirement */ }
 }
 
 // Port of the local VNC server. It lives in a variable and NOT as a connect()
@@ -465,7 +547,12 @@ function moveCursor(dx, dy, held) {
   // at the edge, which is a limitation rather than a breakage — hence the guard
   // instead of a hard dependency.
   if ((overX || overY) && rfb && rfb.clipViewport) {
-    try { rfb._display.viewportChangePos(overX, overY); } catch (e) { /* clamp only */ }
+    // viewportChangePos moves in FRAMEBUFFER pixels; the overshoot is in client
+    // pixels. They differ by the scale as soon as zoom is not 1.
+    try {
+      const s = rfb._display.scale || 1;
+      rfb._display.viewportChangePos(overX / s, overY / s);
+    } catch (e) { /* clamp only */ }
   }
 
   dispatchMouse("mousemove", 0, held);
@@ -484,10 +571,25 @@ function runIntents(list) {
         // The button is already released by the time this runs, so `buttons`
         // is 0 — that is what tells noVNC 1.6 the button went up.
         dispatchMouse("mouseup", it.button, null);
+        releaseCapture();
         break;
       case "click":
         dispatchMouse("mousedown", it.button, it.button);
         dispatchMouse("mouseup", it.button, null);
+        releaseCapture();
+        break;
+      case "zoom":
+        applyPinch(it.factor, it.cx, it.cy);
+        break;
+      case "pan":
+        // Fingers moving right show what is further LEFT, so the viewport origin
+        // decreases. In framebuffer pixels, hence the division by the scale.
+        if (rfb && rfb.clipViewport) {
+          try {
+            const s = rfb._display.scale || 1;
+            rfb._display.viewportChangePos(-it.dx / s, -it.dy / s);
+          } catch (e) { /* no viewport to move */ }
+        }
         break;
       case "scroll": {
         const c = canvasEl();
@@ -521,11 +623,34 @@ function points(ev) {
 // drops a full-screen proxy element into document.body for the duration of a
 // button press, and a listener anchored inside #screen would stop seeing the
 // finger the moment a drag started.
+// Whether the gesture in progress belongs to us. Decided once, at the first
+// finger down, and by GEOMETRY rather than by ev.target: a transparent overlay
+// (noVNC's own pointer capture is one) changes the target without changing what
+// the user is touching, and a target test then hands the toolbar's taps to the
+// trackpad — where preventDefault quietly cancels the click. Geometry cannot be
+// fooled that way. It is also why the decision is not re-made on touchmove: a
+// drag that wanders off the canvas must keep working.
+let engaged = false;
+
+function within(el, x, y) {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
 function handleTouch(ev) {
   if (pointerMode !== "trackpad" || !rfb) return;
-  // The toolbar and the hidden keyboard input are ordinary UI and must keep
-  // their taps.
-  if (ev.target && ev.target.closest && ev.target.closest("#ad-desktop-toolbar")) return;
+
+  if (ev.type === "touchstart" && !engaged) {
+    const p = ev.touches[0];
+    if (!p) return;
+    const c = canvasEl();
+    if (!c || !within(c, p.clientX, p.clientY)) return;
+    if (within(document.getElementById("ad-desktop-toolbar"), p.clientX, p.clientY)) return;
+    engaged = true;
+  }
+  if (!engaged) return;
+  if (ev.touches.length === 0) engaged = false;
   if (!placeCursor()) return;
 
   ev.preventDefault();
@@ -544,12 +669,13 @@ for (const t of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
   document.addEventListener(t, handleTouch, { capture: true, passive: false });
 }
 // A button held when the window goes away would stay held on the remote side.
-window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); });
+window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); engaged = false; });
 
 function setPointerMode(mode) {
   if (mode === pointerMode) return;
   runIntents(trackpad.cancel());
   clearTimeout(longPressTimer);
+  engaged = false;
   pointerMode = mode;
   cursor.placed = false;
   applyViewportMode(); // dragViewport depends on the pointer mode
@@ -623,13 +749,19 @@ function setPointerMode(mode) {
       '<path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.9-6-2.3l-3.6-3.6a2 2 0 0 1 2.8-2.8L7 15"/>'),
   };
 
-  const fitBtn = mkBtn(ICON.zoomIn, "", () => { panMode = !panMode; applyViewportMode(); refreshFit(); setTimeout(updateFrame, 150); });
+  const fitBtn = mkBtn(ICON.zoomIn, "", () => {
+    // The button says "actual size", so it gives actual size: any zoom a pinch
+    // left behind is reset. Pinching keeps its own scale; the button is the way
+    // back to a known one.
+    if (!panMode) zoom = 1;
+    setPanMode(!panMode);
+  });
   function refreshFit() {
     // fit mode -> offer "actual/pan" (expand); pan mode -> offer "fit whole" (compress).
     fitBtn.innerHTML = panMode ? ICON.zoomOut : ICON.zoomIn;
-    fitBtn.title = panMode ? "Fit whole screen" : "Actual size — drag to pan";
-    try { localStorage.setItem("ad-desktop-pan", panMode ? "1" : "0"); } catch (e) { /* ignore */ }
+    fitBtn.title = panMode ? "Fit whole screen" : "Actual size — pinch to zoom, drag to pan";
   }
+  refreshFitButton = refreshFit;
   refreshFit();
 
   const fsBtn = mkBtn(ICON.fullscreen, "Fullscreen", () => {
