@@ -640,6 +640,12 @@ function points(ev) {
 // fooled that way. It is also why the decision is not re-made on touchmove: a
 // drag that wanders off the canvas must keep working.
 let engaged = false;
+// ...and a gesture that is ours to SWALLOW without acting on. A touch on the
+// letterbox beside a fitted desktop belongs to neither the trackpad nor the
+// toolbar, and simply ignoring it lets the browser synthesise a mouse click from
+// it — landing on noVNC at the finger's position, which is exactly the
+// tap-where-you-touch behaviour this mode exists to replace.
+let ignoring = false;
 
 function within(el, x, y) {
   if (!el) return false;
@@ -650,13 +656,26 @@ function within(el, x, y) {
 function handleTouch(ev) {
   if (pointerMode !== "trackpad" || !rfb) return;
 
-  if (ev.type === "touchstart" && !engaged) {
+  if (ev.type === "touchstart" && !engaged && !ignoring) {
     const p = ev.touches[0];
     if (!p) return;
-    const c = canvasEl();
-    if (!c || !within(c, p.clientX, p.clientY)) return;
+    // The toolbar is ordinary UI and keeps its taps, including the synthetic
+    // click the browser makes from them.
     if (within(document.getElementById("ad-desktop-toolbar"), p.clientX, p.clientY)) return;
-    engaged = true;
+    const c = canvasEl();
+    if (c && within(c, p.clientX, p.clientY)) engaged = true;
+    else ignoring = true;
+  }
+  if (ignoring) {
+    // stopPropagation as well as preventDefault. preventDefault only stops the
+    // BROWSER synthesising a mouse click; noVNC's own GestureHandler is attached
+    // to the canvas and would still turn the touch into a click at the finger —
+    // and the browser's touch hit-testing uses the finger's radius, so a tap
+    // just outside the canvas is still delivered with the canvas as its target.
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (ev.touches.length === 0) ignoring = false;
+    return;
   }
   if (!engaged) return;
   if (ev.touches.length === 0) engaged = false;
@@ -678,13 +697,14 @@ for (const t of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
   document.addEventListener(t, handleTouch, { capture: true, passive: false });
 }
 // A button held when the window goes away would stay held on the remote side.
-window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); engaged = false; });
+window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); engaged = false; ignoring = false; });
 
 function setPointerMode(mode) {
   if (mode === pointerMode) return;
   runIntents(trackpad.cancel());
   clearTimeout(longPressTimer);
   engaged = false;
+  ignoring = false;
   pointerMode = mode;
   cursor.placed = false;
   applyViewportMode(); // dragViewport depends on the pointer mode
@@ -788,21 +808,29 @@ function setPointerMode(mode) {
 
   // Pointer mode, touch only: with a real mouse the direct path is already
   // relative pointing with a visible cursor, so the toggle would be noise.
-  // Like the fit button, this one shows the mode it will SWITCH TO, not the one
-  // in force — the tooltip says so out loud, since a mode button can be read
-  // either way.
+  //
+  // Unlike the fit button, this one shows the mode you are IN, and highlights
+  // itself while the trackpad is on. A mode button that shows what it will
+  // switch TO reads exactly backwards to half the people who see it, and the
+  // cost here is not cosmetic: believing you are in trackpad mode while in
+  // direct touch, in a zoomed view, means one-finger drags pan the viewport and
+  // nothing can be dragged at all.
   const ptrBtn = mkBtn(ICON.trackpad, "", () => {
     setPointerMode(pointerMode === "trackpad" ? "touch" : "trackpad");
     refreshPtr();
   });
+  ptrBtn.id = "ad-pointer-btn";
   function refreshPtr() {
-    const toTrackpad = pointerMode !== "trackpad";
-    ptrBtn.innerHTML = toTrackpad ? ICON.trackpad : ICON.directTouch;
-    const title = toTrackpad
-      ? "Trackpad — slide to move the pointer, tap to click"
-      : "Direct touch — tap where you want to click";
+    const on = pointerMode === "trackpad";
+    ptrBtn.innerHTML = on ? ICON.trackpad : ICON.directTouch;
+    const title = on
+      ? "Trackpad: slide to move the pointer, tap to click — tap here for direct touch"
+      : "Direct touch: tap where you want to click — tap here for the trackpad";
     ptrBtn.title = title;
     ptrBtn.setAttribute("aria-label", title);
+    ptrBtn.setAttribute("aria-pressed", on ? "true" : "false");
+    ptrBtn.style.background = on ? "rgba(70,130,255,.85)" : "rgba(30,30,30,.85)";
+    ptrBtn.style.borderColor = on ? "rgba(140,180,255,.9)" : "rgba(255,255,255,.2)";
   }
   refreshPtr();
 

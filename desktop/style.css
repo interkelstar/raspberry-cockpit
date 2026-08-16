@@ -13,6 +13,14 @@ body {
   padding: 24px;
   background: #151515;
 }
+#screen, #screen canvas {
+  /* Every touch here is ours — pointer, gestures, pinch. Without this the
+     browser keeps its own gesture arbitration (pan, double-tap zoom) and decides
+     mid-gesture whether to hand the touches over. noVNC sets exactly this on its
+     canvas in app/styles/base.css, which is part of its bundled UI and not of
+     core/rfb.js — so importing only the core, as this plugin does, leaves it off. */
+  touch-action: none;
+}
 #screen {
   width: 100%;
   height: 100%;

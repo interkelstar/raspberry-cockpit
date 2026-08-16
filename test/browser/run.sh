@@ -45,8 +45,17 @@ trap cleanup EXIT
 
 say "Staging the page"
 cp "$SRC"/desktop/*.js "$SRC"/desktop/style.css "$WORK"/
-cp "$SRC"/test/browser/harness.html "$WORK"/index.html
+cp "$SRC"/test/browser/stub.js "$WORK"/
 ln -s "$NOVNC" "$WORK/novnc"
+# The page under test is the SHIPPED index.html with one line changed: Cockpit's
+# base1/cockpit.js becomes our stub. It used to be a hand-written copy, and the
+# copy had drifted — it carried a viewport meta the real page did not, so the
+# harness was testing a page more mobile-friendly than the one users get, and a
+# phone-only gesture failure could not reproduce. Anything in the real <head>
+# now applies here by construction.
+sed 's|<script src="../base1/cockpit.js"></script>|<script src="stub.js"></script>|' \
+    "$SRC/desktop/index.html" > "$WORK/index.html"
+grep -q 'src="stub.js"' "$WORK/index.html" || die "could not substitute the cockpit.js tag — has desktop/index.html changed?"
 # One diagnostic shim, applied to the COPY only: it records the recogniser's
 # decisions so a failure says "it decided click:2" rather than just "no bytes".
 # The shipped app.js stays free of test hooks.

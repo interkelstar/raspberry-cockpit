@@ -95,8 +95,22 @@ check("no page errors", state.err.length === 0, state.err.join("; "));
 check("RFB handshake completed: framebuffer is 1920x1080",
       !!state.canvas && state.canvas.w === 1920 && state.canvas.h === 1080,
       state.canvas ? `${state.canvas.w}x${state.canvas.h}` : "no canvas");
-check("the pointer-mode button is in the toolbar",
-      state.buttons.some((t) => /Trackpad/.test(t)), state.buttons.join(" | "));
+check("the pointer-mode button is in the toolbar, showing the mode in force",
+      /^Direct touch:/.test(state.buttons.find((t) => /touch|Trackpad/i.test(t)) || ""),
+      state.buttons.join(" | "));
+
+// Two properties a phone needs and a desktop never misses. Neither is visible
+// in any behaviour this harness can drive — CDP injects touches below the level
+// where the browser arbitrates gestures — so they are asserted directly.
+const mobile = await evaluate(`(() => {
+  const m = document.querySelector('meta[name="viewport"]');
+  const c = document.querySelector('#screen canvas');
+  return { viewport: m ? m.content : null, touchAction: c ? getComputedStyle(c).touchAction : null };
+})()`);
+check("the page declares a mobile viewport",
+      !!mobile.viewport && /width=device-width/.test(mobile.viewport), String(mobile.viewport));
+check("the canvas claims every touch (touch-action: none)",
+      mobile.touchAction === "none", String(mobile.touchAction));
 
 const rect = state.canvas.rect;
 const scale = 1920 / rect.w;
@@ -117,12 +131,13 @@ check("direct mode taps where the finger is",
 
 // ------------------------------------------------------------------- switch
 const switched = await evaluate(`(() => {
-  const b = [...document.querySelectorAll('#ad-desktop-toolbar button')].find(b => /Trackpad/.test(b.title));
+  const b = document.getElementById("ad-pointer-btn");
   if (!b) return "no button";
   b.click();
-  return [...document.querySelectorAll('#ad-desktop-toolbar button')].map(x => x.title).join(" | ");
+  return b.title + " || pressed=" + b.getAttribute("aria-pressed");
 })()`);
-check("the button switches mode and flips its own label", /Direct touch/.test(switched), switched);
+check("the button switches mode, and says which mode is now in force",
+      /^Trackpad:/.test(switched) && /pressed=true/.test(switched), switched);
 await sleep(200);
 
 // A slow slide: the pointer must move, and by LESS than 1:1 mapping would give.
@@ -215,6 +230,20 @@ check("touching down elsewhere after a tap moves the pointer, it does not drag",
       far2.filter((m) => m.mask === 1).length === 1,
       JSON.stringify(far2.map((m) => m.mask)));
 
+// A fitted desktop is letterboxed inside its container. A tap on the bars is
+// neither the trackpad's nor the toolbar's — and letting it through means the
+// browser synthesises a mouse click from it, landing on noVNC at the finger,
+// which is the very behaviour this mode replaces.
+await settle();
+await reset();
+const bar0 = { x: Math.round(rect.x + rect.w / 2), y: Math.round(rect.y - 8) };
+if (bar0.y > 4) {
+  await tp("touchStart", [{ id: 1, ...bar0 }], 70);
+  await tp("touchEnd", [], 250);
+  const strays = await sent();
+  check("a tap on the letterbox does nothing at all", strays.length === 0, JSON.stringify(strays));
+}
+
 // Two fingers sliding -> wheel. noVNC turns wheel into buttons 4/5 (mask 8/16).
 await settle();
 await reset();
@@ -297,10 +326,8 @@ check("zooming back out shows MORE desktop, at the same size on screen",
       `${zoomedIn.viewport} -> ${zoomedOut.viewport} desktop px, drawn ${zoomedOut.drawn}px in ${zoomedOut.container}px`);
 
 check("the toolbar is in the order keyboard, pointer, zoom, fullscreen",
-      (await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title.split(/[ —]/)[0]).join(",")`))
-        === "Keyboard,Trackpad,Fit,Fullscreen" ||
-      (await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title.split(/[ —]/)[0]).join(",")`))
-        === "Keyboard,Direct,Fit,Fullscreen",
+      /^Keyboard,(Trackpad|Direct),(Fit|Actual),Fullscreen$/.test(
+        await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title.split(/[ —:]/)[0]).join(",")`)),
       await evaluate(`[...document.querySelectorAll('#ad-desktop-toolbar button')].map(b => b.title).join(" | ")`));
 
 // The visible pointer: noVNC's own cursor overlay must be there and following.
