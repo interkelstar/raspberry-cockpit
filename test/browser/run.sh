@@ -14,13 +14,23 @@
 #
 # Not part of `npm test`: it needs chromium and takes ~30s.
 #
-#   ./test/browser/run.sh                 # uses the installed plugin's noVNC
+#   ./test/browser/run.sh                 # picks up an uncompressed noVNC itself
 #   NOVNC=/path/to/novnc ./test/browser/run.sh
 
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-NOVNC="${NOVNC:-/usr/share/cockpit/desktop/novnc}"
+# The installed plugin's noVNC is served COMPRESSED — Cockpit answers x.js with
+# x.js.gz — and a browser loading the harness over file:// has no server to
+# decompress anything. So the distribution's own copy comes first; the installed
+# one is a fallback for a machine that only ever got noVNC through this plugin.
+NOVNC="${NOVNC:-}"
+if [ -z "$NOVNC" ]; then
+    for d in /usr/share/novnc /usr/share/cockpit/desktop/novnc; do
+        [ -e "$d/core/rfb.js" ] && { NOVNC="$d"; break; }
+    done
+    NOVNC="${NOVNC:-/usr/share/novnc}"
+fi
 CDP_PORT="${CDP_PORT:-9333}"
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -32,7 +42,8 @@ for c in chromium-browser chromium google-chrome chrome; do
 done
 [ -n "$CHROME" ] || die "no chromium/chrome on PATH"
 command -v node >/dev/null 2>&1 || die "node is required"
-[ -d "$NOVNC/core" ] || die "no noVNC at $NOVNC — install the plugin first, or set NOVNC=..."
+[ -d "$NOVNC/core" ] || die "no noVNC at $NOVNC — install the novnc package, or set NOVNC=..."
+[ -e "$NOVNC/core/rfb.js" ] || die "noVNC at $NOVNC has no plain core/rfb.js (compressed?) — set NOVNC to an uncompressed copy"
 
 WORK="$(mktemp -d)"
 PROFILE="$(mktemp -d)"
