@@ -15,40 +15,48 @@
 
 set -euo pipefail
 
-DEST="${RASPBERRY_COCKPIT_DIR:-$HOME/.local/share/raspberry-cockpit}"
-REPO="${RASPBERRY_COCKPIT_REPO:-https://github.com/interkelstar/raspberry-cockpit.git}"
+# Everything below lives in a function that is only CALLED at the very end. Under
+# `curl | bash` a dropped connection executes whatever prefix arrived; wrapped
+# like this, a truncated transfer is a syntax error instead of half an install.
+main() {
 
-say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-ok()   { printf '   \033[32m✓\033[0m %s\n' "$*"; }
-die()  { printf '\n\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+    DEST="${RASPBERRY_COCKPIT_DIR:-$HOME/.local/share/raspberry-cockpit}"
+    REPO="${RASPBERRY_COCKPIT_REPO:-https://github.com/interkelstar/raspberry-cockpit.git}"
 
-[ "$(id -u)" != 0 ] || die "run as your normal user, not root — the installer calls sudo itself
-   and creates per-user systemd units that root would put in the wrong place."
+    say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+    ok()   { printf '   \033[32m✓\033[0m %s\n' "$*"; }
+    die()  { printf '\n\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-command -v git >/dev/null 2>&1 || die "git is required: sudo apt install -y git"
+    [ "$(id -u)" != 0 ] || die "run as your normal user, not root — the installer calls sudo itself
+       and creates per-user systemd units that root would put in the wrong place."
 
-say "Fetching raspberry-cockpit"
-if [ -d "$DEST/.git" ]; then
-    git -C "$DEST" pull --ff-only --quiet || die "could not update $DEST — move it aside and retry"
-    ok "updated $DEST"
-else
-    mkdir -p "$(dirname "$DEST")"
-    git clone --depth 1 --quiet "$REPO" "$DEST" || die "could not clone $REPO"
-    ok "cloned into $DEST"
-fi
+    command -v git >/dev/null 2>&1 || die "git is required: sudo apt install -y git"
 
-# The whole reason this block exists: under `curl | bash` the script's stdin IS
-# the pipe. Anything downstream that reads stdin — most importantly sudo's
-# password prompt, and apt's occasional questions — would either read the
-# remainder of this script as input or fail outright with no explanation.
-# Re-attaching the terminal fixes it. When there is no terminal (CI, a
-# provisioning run), stdin is closed instead so a prompt fails loudly and at
-# once rather than hanging forever waiting for input that cannot arrive.
-say "Running the installer"
-if [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
-    exec "$DEST/install.sh" "$@" < /dev/tty
-else
-    printf '   \033[33m⚠\033[0m no terminal available — if sudo needs a password this will fail fast.\n'
-    printf '       Pre-authorise with `sudo -v` first, or run %s/install.sh directly.\n' "$DEST"
-    exec "$DEST/install.sh" "$@" < /dev/null
-fi
+    say "Fetching raspberry-cockpit"
+    if [ -d "$DEST/.git" ]; then
+        git -C "$DEST" pull --ff-only --quiet || die "could not update $DEST — move it aside and retry"
+        ok "updated $DEST"
+    else
+        mkdir -p "$(dirname "$DEST")"
+        git clone --depth 1 --quiet "$REPO" "$DEST" || die "could not clone $REPO"
+        ok "cloned into $DEST"
+    fi
+
+    # The whole reason this block exists: under `curl | bash` the script's stdin IS
+    # the pipe. Anything downstream that reads stdin — most importantly sudo's
+    # password prompt, and apt's occasional questions — would either read the
+    # remainder of this script as input or fail outright with no explanation.
+    # Re-attaching the terminal fixes it. When there is no terminal (CI, a
+    # provisioning run), stdin is closed instead so a prompt fails loudly and at
+    # once rather than hanging forever waiting for input that cannot arrive.
+    say "Running the installer"
+    if [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
+        exec "$DEST/install.sh" "$@" < /dev/tty
+    else
+        printf '   \033[33m⚠\033[0m no terminal available — if sudo needs a password this will fail fast.\n'
+        printf '       Pre-authorise with `sudo -v` first, or run %s/install.sh directly.\n' "$DEST"
+        exec "$DEST/install.sh" "$@" < /dev/null
+    fi
+}
+
+main "$@"

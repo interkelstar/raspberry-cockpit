@@ -209,6 +209,24 @@ const two = await sent();
 check("a two-finger tap is a right click", two.some((m) => m.mask === 4),
       JSON.stringify(two) + " touches=" + JSON.stringify(await evaluate("window.__touch")) + " intents=" + JSON.stringify(await evaluate("window.__intents")));
 
+// Three fingers: middle click, RFB mask 2. Worth its own check because DOM's two
+// button numberings disagree exactly here — `button` says 1 for middle while
+// `buttons` says 4 — so a reversed mapping trades middle for right silently, and
+// the right-click check above would still pass.
+await settle();
+await reset();
+await burst([
+  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }]],
+  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x, y: mid.y }]],
+  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x, y: mid.y }, { id: 3, x: mid.x + 40, y: mid.y }]],
+  ["touchEnd", [{ id: 2, x: mid.x, y: mid.y }, { id: 3, x: mid.x + 40, y: mid.y }]],
+  ["touchEnd", [{ id: 3, x: mid.x + 40, y: mid.y }]],
+  ["touchEnd", []],
+]);
+const three = await sent();
+check("a three-finger tap is a middle click", three.some((m) => m.mask === 2),
+      JSON.stringify([...new Set(three.map((m) => m.mask))]));
+
 // Hold still, then move: the button stays down for the whole drag.
 await settle();
 await reset();
@@ -230,11 +248,18 @@ check("a long press starts a drag and holds the button through it",
 // timing it will actually see.
 await settle();
 await reset();
-await tp("touchStart", [{ id: 1, ...mid }], 70);
-await tp("touchEnd", [], 300);                      // human gap after the tap
-await tp("touchStart", [{ id: 2, ...mid }], 150);   // and a dwell before moving
-for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x, y: mid.y + i * 12 }]);
-await tp("touchEnd", []);
+// Explicit event times, so the gaps are the gaps and not whatever CDP latency
+// happened to be. Paced by round trip this check passed or failed with the load
+// on the machine, which is worse than not having it.
+let c0 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, ...mid }], c0);
+await tpAt("touchEnd", [], c0 + 70);                       // a 70ms tap
+await tpAt("touchStart", [{ id: 2, ...mid }], c0 + 370);   // 300ms later, inside the window
+await tpAt("touchMove", [{ id: 2, x: mid.x, y: mid.y + 14 }], c0 + 520);   // after a dwell
+for (let i = 2; i <= 5; i++) {
+  await tpAt("touchMove", [{ id: 2, x: mid.x, y: mid.y + i * 14 }], c0 + 520 + i * 30);
+}
+await tpAt("touchEnd", [], c0 + 700);
 const chain = await sent();
 const chainMasks = chain.map((m) => m.mask);
 check("tap, pause, touch and slide drags", chain.filter((m) => m.mask === 1).length >= 3,
@@ -268,17 +293,17 @@ check("the tap that began the drag sent no click of its own",
 // cost of a window wide enough to hit, and what the distance condition buys back.
 await settle();
 await reset();
-await tp("touchStart", [{ id: 1, ...mid }], 70);
-await tp("touchEnd", [], 250);
-// Touch and first movement together: left to separate round trips, CDP latency
-// can put more than LONG_PRESS_MS between them and the long press turns this into
-// a drag for reasons that have nothing to do with arming.
-await burst([
-  ["touchStart", [{ id: 2, x: mid.x + 120, y: mid.y }]],
-  ["touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + 15 }]],
-]);
-for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + 15 + i * 12 }]);
-await tp("touchEnd", []);
+// Same treatment: stated times, so what is being tested is the DISTANCE rule and
+// not the harness's reflexes. Well inside the time window, well outside the space
+// one.
+c0 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, ...mid }], c0);
+await tpAt("touchEnd", [], c0 + 70);
+await tpAt("touchStart", [{ id: 2, x: mid.x + 120, y: mid.y }], c0 + 320);
+for (let i = 1; i <= 5; i++) {
+  await tpAt("touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + i * 14 }], c0 + 320 + i * 30);
+}
+await tpAt("touchEnd", [], c0 + 500);
 const far2 = await sent();
 // Exactly one press: the tap's own. A drag would add a second, held across the
 // moves that follow.
@@ -345,6 +370,11 @@ check("and the coast stops on its own", settled.n === coasting.n && settled.x ==
 await settle();
 await reset();
 const bar0 = { x: Math.round(rect.x + rect.w / 2), y: Math.round(rect.y - 8) };
+// Reported by review: wrapped in a bare `if`, this check DISAPPEARED when the
+// precondition did not hold — the run still printed "N/N passed" with one fewer
+// check and no sign of it. Now the precondition is itself a check.
+check("there is letterbox above the fitted desktop to tap on", bar0.y > 4,
+      `canvas top at ${Math.round(rect.y)}`);
 if (bar0.y > 4) {
   await tp("touchStart", [{ id: 1, ...bar0 }], 70);
   await tp("touchEnd", [], 250);

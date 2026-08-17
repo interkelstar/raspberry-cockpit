@@ -43,10 +43,14 @@ test("a short still touch is a left click, once the hold expires", () => {
     assert.equal(t.clickPending, false);
 });
 
+// The empty return is not enough on its own: a HELD-BACK click returns empty too,
+// so this asserted nothing until it also checked that no click is waiting.
 test("a touch held past the tap window is not a click", () => {
     const t = createTrackpad();
     t.touchStart([p(1, 100, 100)], 0);
     assert.deepEqual(t.touchEnd([], TAP_MAX_MS + 1), []);
+    assert.equal(t.clickPending, false);
+    assert.deepEqual(t.flush(TAP_MAX_MS + 1 + TAP_HOLD_MS), []);
 });
 
 test("a touch that wandered is a move, not a click", () => {
@@ -418,4 +422,49 @@ test("a move that does not list the tracked finger moves nothing", () => {
     const t = createTrackpad();
     t.touchStart([p(1, 100, 100)], 0);
     assert.deepEqual(t.touchMove([p(9, 400, 400)], 20), []);
+});
+
+// Reported by review, and it reproduces: a two-finger tap that the browser
+// delivers with even ONE touchmove in it loses its right click entirely. A
+// one-finger tap gets TAP_SLOP of tolerance; this had none.
+test("a two-finger tap survives a pixel of finger drift", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchStart([p(1, 100, 100), p(2, 140, 100)], 10);
+    t.touchMove([p(1, 101, 100), p(2, 140, 101)], 40);     // drift, not a gesture
+    t.touchEnd([p(2, 140, 101)], 90);
+    assert.deepEqual(t.touchEnd([], 100), [{ t: "click", button: 2 }]);
+});
+
+test("a three-finger tap survives drift too, and is a middle click", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchStart([p(1, 100, 100), p(2, 140, 100)], 8);
+    t.touchStart([p(1, 100, 100), p(2, 140, 100), p(3, 180, 100)], 16);
+    t.touchMove([p(1, 100, 102), p(2, 141, 100), p(3, 180, 101)], 40);
+    t.touchEnd([p(2, 141, 100), p(3, 180, 101)], 90);
+    t.touchEnd([p(3, 180, 101)], 95);
+    assert.deepEqual(t.touchEnd([], 100), [{ t: "click", button: 1 }]);
+});
+
+// Two fingers resting still are not a press waiting to happen: a two-finger hold
+// is the opening of a right click or a scroll, and pressing the left button under
+// it would be wrong in both cases.
+test("a two-finger hold never becomes a drag", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchStart([p(1, 100, 100), p(2, 140, 100)], 10);
+    assert.deepEqual(t.tick(LONG_PRESS_MS + 50), []);
+    assert.equal(t.holding, null);
+});
+
+// Losing the window between a tap and whatever might have followed it must not
+// lose the tap: the click is owed, and cancel is the last chance to pay it.
+test("cancel delivers a click that was still waiting", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchEnd([], 60);
+    assert.equal(t.clickPending, true);
+    assert.deepEqual(t.cancel(), [{ t: "click", button: 0 }]);
+    assert.equal(t.clickPending, false);
 });

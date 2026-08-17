@@ -23,14 +23,31 @@ export function parsePort(text, fallback = DEFAULT_PORT) {
     return (p > 0 && p < 65536) ? p : fallback;
 }
 
-// Kept apart from parsePort because this is where I/O and the dependency on
-// cockpit begin. Never throws — the caller needs no .catch.
-export async function readPort(fallback = DEFAULT_PORT) {
+// A unix socket path, if the installer configured one. Preferred over a port
+// when present: a socket in the user's runtime directory is reachable by that
+// user alone, where a no-auth listener on 127.0.0.1 is reachable by every
+// process on the machine whatever its UID. See parsePort for the format.
+//
+// Anything that is not an absolute path is ignored rather than passed on: this
+// value ends up as the target of a Cockpit stream channel, so a relative or
+// empty one should fall back to the port, not open something unintended.
+export function parseSocket(text) {
+    if (typeof text !== "string") return null;
+    const m = text.match(/^[ \t]*socket[ \t]*=[ \t]*(\/[^\s#]+)[ \t]*$/m);
+    return m ? m[1] : null;
+}
+
+// Kept apart from the parsers because this is where I/O and the dependency on
+// cockpit begin. Never throws — the caller needs no .catch. Returns the socket
+// path when one is configured, otherwise a port.
+export async function readTarget(fallbackPort = DEFAULT_PORT) {
+    let text = "";
     try {
-        const text = await cockpit.file(CONFIG_PATH).read();
-        return parsePort(text, fallback);
+        text = await cockpit.file(CONFIG_PATH).read();
     } catch (e) {
-        // No file, or unreadable — not an error, just "use the default port".
-        return fallback;
+        // No file, or unreadable — not an error, just "use the defaults".
+        return { port: fallbackPort };
     }
+    const socket = parseSocket(text);
+    return socket ? { socket } : { port: parsePort(text, fallbackPort) };
 }

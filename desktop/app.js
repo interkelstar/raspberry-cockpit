@@ -1,7 +1,7 @@
 import RFB from "./novnc/core/rfb.js";
 // The port lives in its own module so the parsing can be unit-tested: this file
 // touches the DOM and noVNC on import and cannot be loaded under node.
-import { readPort, DEFAULT_PORT } from "./config.js";
+import { readTarget, DEFAULT_PORT } from "./config.js";
 // Same reason again: the gesture recognition is where the decisions are, so it
 // lives apart from the DOM and is unit-tested.
 import { createTrackpad, LONG_PRESS_MS, TAP_HOLD_MS } from "./trackpad.js";
@@ -75,6 +75,36 @@ function applyZoom() {
   } catch (e) { /* no scaling available — stay wherever noVNC put us */ }
 }
 
+// Panning in whole framebuffer pixels, with the fraction carried over.
+// Display.viewportChangePos FLOORS its deltas and keeps no remainder, so every
+// sub-pixel request was thrown away — and floor is not symmetric about zero, so
+// it was thrown away in one direction only. At zoom 4 a slow push against the
+// right edge asks for 0.275px and gets nothing, while the same push at the left
+// edge floors to -1 and moves: the pan worked leftwards and not rightwards.
+//
+// It also reports whether the viewport actually MOVED, read through absX/absY,
+// which return the viewport origin. The coast needs that: "the overshoot was
+// non-zero" is not the same as "we went somewhere", and at the framebuffer
+// boundary viewportChangePos returns having done nothing.
+const panRest = { x: 0, y: 0 };
+function panViewport(dxFb, dyFb) {
+  if (!rfb) return false;
+  try {
+    const d = rfb._display;
+    panRest.x += dxFb;
+    panRest.y += dyFb;
+    const ix = Math.trunc(panRest.x), iy = Math.trunc(panRest.y);
+    if (ix === 0 && iy === 0) return false;
+    panRest.x -= ix;
+    panRest.y -= iy;
+    const wasX = d.absX(0), wasY = d.absY(0);
+    d.viewportChangePos(ix, iy);
+    return d.absX(0) !== wasX || d.absY(0) !== wasY;
+  } catch (e) {
+    return false;
+  }
+}
+
 // The scale at which the whole desktop fits. Below it, panning has nothing to
 // pan to, so that is the point where pinching in should hand back to fit mode.
 function fitScale() {
@@ -122,21 +152,28 @@ function applyPinch(factor, cx, cy) {
   try {
     const after = rfb._display.scale;
     const k = (1 / before) - (1 / after);
-    rfb._display.viewportChangePos((cx - rect.left) * k, (cy - rect.top) * k);
+    panViewport((cx - rect.left) * k, (cy - rect.top) * k);
   } catch (e) { /* anchoring is a nicety, not a requirement */ }
 }
 
-// Port of the local VNC server. It lives in a variable and NOT as a connect()
-// argument: on a drop, reconnect is called as setTimeout(connect, 1500) — with NO
-// arguments — so a port parameter would silently become undefined. That gives the
-// worst possible failure: the first connection works, recovery after a drop does not.
-let vncPort = DEFAULT_PORT;
+// Where the local VNC server is. A unix socket when the installer could arrange
+// one, a port otherwise. It lives in a variable and NOT as a connect() argument:
+// on a drop, reconnect is called as setTimeout(connect, 1500) — with NO arguments
+// — so a parameter would silently become undefined. That gives the worst possible
+// failure: the first connection works, recovery after a drop does not.
+let vncTarget = { port: DEFAULT_PORT };
 
-// noVNC over a Cockpit stream channel to the local VNC (127.0.0.1:<vncPort>), wrapped as a
+// noVNC over a Cockpit stream channel to the local VNC, wrapped as a
 // WebSocket-like object that RFB/Websock.attach() accepts. The Cockpit session authenticates
 // it — no websockify, no extra password: reaching this tab already required a Cockpit/PAM login.
 function cockpitVncSocket() {
-  const channel = cockpit.channel({ payload: "stream", address: "127.0.0.1", port: vncPort, binary: true });
+  // A unix socket is reachable by its owner and nobody else; a no-auth listener
+  // on 127.0.0.1 is reachable by every process on the machine, of any UID, and
+  // full pointer, keyboard and screen access is what that gets them. The port is
+  // the fallback for servers that cannot do sockets.
+  const channel = cockpit.channel(vncTarget.socket
+    ? { payload: "stream", unix: vncTarget.socket, binary: true }
+    : { payload: "stream", address: "127.0.0.1", port: vncTarget.port, binary: true });
   const sock = {
     binaryType: "arraybuffer", readyState: 0, bufferedAmount: 0, protocol: "",
     onclose: null, onerror: null,
@@ -255,6 +292,7 @@ function connect() {
   // A reconnect builds a new canvas, so the remembered pointer position belongs
   // to an element that no longer exists — drop it and re-centre on first use.
   cursor.placed = false;
+  panRest.x = 0; panRest.y = 0;
   applyViewportMode();
   rfb.resizeSession = false;
   rfb.qualityLevel = 8;
@@ -265,6 +303,17 @@ function connect() {
   });
 
   rfb.addEventListener("disconnect", () => {
+    // Everything blur does, and for the same reason: noVNC removes the canvas on
+    // cleanup while our `rfb` stays truthy, so a finger still down when the
+    // channel drops has its touchend swallowed and the recogniser keeps `held`.
+    // On noVNC 1.6, which reads ev.buttons, that turns every later mousemove
+    // into a held left button — a stuck drag that survives the reconnect.
+    runIntents(trackpad.cancel());
+    clearTimeout(longPressTimer);
+    clearTimeout(flushTimer);
+    stopGlide();
+    engaged = false;
+    ignoring = false;
     setTimeout(connect, 1500);
   });
 }
@@ -286,9 +335,10 @@ const screenEl = document.getElementById("screen");
 // didn't line up with native). Cached; refreshed on resize.
 let NATIVE = { top: 24, right: 24, bottom: 24, left: 24, radius: 16 };
 function refreshNative() {
+  let page = null;
   try {
     const pdoc = window.parent.document;
-    const page = pdoc.createElement("div"); page.className = "pf-v6-c-page";
+    page = pdoc.createElement("div"); page.className = "pf-v6-c-page";
     page.style.cssText = "position:absolute;left:-9999px;top:0;width:800px;height:800px;visibility:hidden";
     const mc = pdoc.createElement("div"); mc.className = "pf-v6-c-page__main-container";
     page.appendChild(mc); pdoc.body.appendChild(page);
@@ -303,8 +353,20 @@ function refreshNative() {
       right: inset, bottom: inset, left: inset,
       radius: num(cs.borderTopLeftRadius, 16),
     };
-    pdoc.body.removeChild(page);
-  } catch (e) { /* keep defaults */ }
+  } catch (e) { /* keep defaults */
+  } finally {
+    // In a finally, because a throw between the append and the remove leaks a
+    // hidden div into the SHELL's document, not ours, and it accumulates.
+    try { if (page && page.parentNode) page.parentNode.removeChild(page); } catch (e2) { /* gone already */ }
+  }
+}
+// resize fires continuously while a window is dragged or a mobile keyboard
+// animates, and each call above mutates the parent document and forces a layout
+// in the Cockpit shell. Coalesce to one measurement per burst.
+let nativeTimer = null;
+function refreshNativeSoon() {
+  clearTimeout(nativeTimer);
+  nativeTimer = setTimeout(refreshNative, 120);
 }
 // The frame is dropped only when Cockpit has moved the nav out of the left column into its
 // collapsed/hamburger mode (the masthead toggle becomes visible) — NOT merely on a narrow or
@@ -357,7 +419,7 @@ new MutationObserver(() => {
   updateFrame();
 }).observe(screenEl, { childList: true, subtree: true });
 document.addEventListener("fullscreenchange", updateFrame);
-window.addEventListener("resize", () => { refreshNative(); updateFrame(); });
+window.addEventListener("resize", () => { refreshNativeSoon(); updateFrame(); });
 
 // Ctrl (Win/Linux) or Cmd (macOS) both become Ctrl on the remote side.
 // e.code is the physical key, independent of layout (e.key with a Cyrillic
@@ -407,6 +469,13 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (!(e.ctrlKey || e.metaKey)) return;
+  // Shift and Alt must fall THROUGH to noVNC untouched. This block rewrites a
+  // combination into a bare Ctrl+<key>, and it used to do so on e.code alone —
+  // so Ctrl+Shift+C, which is how every Linux terminal copies, arrived at the
+  // remote as Ctrl+C and sent SIGINT to whatever was running. The same downgrade
+  // hit Ctrl+Shift+A/X and every Ctrl+Alt variant. Intercepting only the plain
+  // combination is both correct and the smaller claim.
+  if (e.shiftKey || e.altKey) return;
   if (e.code === "KeyV" || e.code === "KeyC" || e.code === "KeyX" || e.code === "KeyA") {
     suppressedUp.add(e.code);
   }
@@ -496,17 +565,25 @@ let flushTimer = null;
 const GLIDE_TAU = 110;
 let glide = null;
 
-function stopGlide() { glide = null; }
+// A generation counter, not just a null. stopGlide() cannot unqueue a frame that
+// requestAnimationFrame has already accepted, so a flick completed inside one
+// frame interval — touchstart stops the coast, touchend starts a new one, all
+// before the pending callback runs — left the OLD loop alive to find a truthy
+// glide and schedule itself again. Two loops then share one glide: double speed,
+// double decay, twice the pointer events on the wire.
+let glideGen = 0;
+function stopGlide() { glide = null; glideGen++; }
 
 // The flick, i.e. pointer inertia. A small trackpad crossing a 1920px desktop
 // needs it as much as acceleration does: the two solve the same problem from
 // different ends, and without inertia every long move is several strokes.
 function startGlide(vx, vy) {
-  glide = { vx, vy, at: null };
+  glideGen++;
+  glide = { vx, vy, at: null, gen: glideGen };
   requestAnimationFrame(stepGlide);
 }
 function stepGlide(now) {
-  if (!glide) return;
+  if (!glide || glide.gen !== glideGen) return;
   // The first frame only establishes the clock. Its interval is zero, so it moves
   // the pointer nowhere — and "went nowhere" is the signal that stops the coast,
   // so acting on this frame killed every flick on the frame it began.
@@ -599,19 +676,20 @@ function moveCursor(dx, dy, held) {
   // _display is private API; if a future noVNC drops it the pointer simply stops
   // at the edge, which is a limitation rather than a breakage — hence the guard
   // instead of a hard dependency.
+  let panned = false;
   if ((overX || overY) && rfb && rfb.clipViewport) {
-    // viewportChangePos moves in FRAMEBUFFER pixels; the overshoot is in client
-    // pixels. They differ by the scale as soon as zoom is not 1.
-    try {
-      const s = rfb._display.scale || 1;
-      rfb._display.viewportChangePos(overX / s, overY / s);
-    } catch (e) { /* clamp only */ }
+    // panViewport takes FRAMEBUFFER pixels; the overshoot is in client pixels.
+    // They differ by the scale as soon as zoom is not 1.
+    let sc = 1;
+    try { sc = rfb._display.scale || 1; } catch (e) { /* keep 1 */ }
+    panned = panViewport(overX / sc, overY / sc);
   }
 
   dispatchMouse("mousemove", 0, held);
   // "Went nowhere" has to include the edge-pan case: pinned against the edge but
-  // scrolling the desktop underneath is still going somewhere.
-  return cursor.x !== wasX || cursor.y !== wasY || !!(overX || overY) && !!(rfb && rfb.clipViewport);
+  // scrolling the desktop underneath is still going somewhere. It has to mean the
+  // viewport MOVED, though — not merely that we asked it to.
+  return cursor.x !== wasX || cursor.y !== wasY || panned;
 }
 
 function runIntents(list) {
@@ -644,10 +722,9 @@ function runIntents(list) {
         // Fingers moving right show what is further LEFT, so the viewport origin
         // decreases. In framebuffer pixels, hence the division by the scale.
         if (rfb && rfb.clipViewport) {
-          try {
-            const s = rfb._display.scale || 1;
-            rfb._display.viewportChangePos(-it.dx / s, -it.dy / s);
-          } catch (e) { /* no viewport to move */ }
+          let sc = 1;
+          try { sc = rfb._display.scale || 1; } catch (e) { /* keep 1 */ }
+          panViewport(-it.dx / sc, -it.dy / sc);
         }
         break;
       case "scroll": {
@@ -748,7 +825,15 @@ function handleTouch(ev) {
   }
   if (!engaged) return;
   if (ev.touches.length === 0) engaged = false;
-  if (!placeCursor()) return;
+  if (!placeCursor()) {
+    // No canvas — a reconnect took it out from under a gesture in progress.
+    // Returning quietly would leave the recogniser mid-gesture, holding a button
+    // nobody will ever release.
+    runIntents(trackpad.cancel());
+    engaged = false;
+    ignoring = false;
+    return;
+  }
 
   ev.preventDefault();
   ev.stopPropagation();
@@ -787,6 +872,7 @@ function setPointerMode(mode) {
   ignoring = false;
   pointerMode = mode;
   cursor.placed = false;
+  panRest.x = 0; panRest.y = 0;
   applyViewportMode(); // dragViewport depends on the pointer mode
   if (pointerMode === "trackpad") placeCursor();
   try { localStorage.setItem("ad-desktop-pointer", pointerMode); } catch (e) { /* ignore */ }
@@ -817,6 +903,18 @@ function setPointerMode(mode) {
       rfb.sendKey(0xff0d, "Enter");
     } else if (e.inputType === "deleteContentBackward") {
       rfb.sendKey(0xff08, "Backspace");
+    } else if (e.data) {
+      // Everything else that carries text: insertCompositionText from Android's
+      // predictive keyboard, insertReplacementText, insertFromPaste. Swallowing
+      // these — preventDefault with nothing sent — made those keyboards look
+      // broken rather than merely imperfect.
+      for (const ch of e.data) {
+        const cp = ch.codePointAt(0);
+        rfb.sendKey(cp < 0x100 ? cp : 0x01000000 + cp, null);
+      }
+    } else {
+      // Nothing to send and nothing gained by blocking it locally.
+      return;
     }
     e.preventDefault();
     kbInput.value = "";
@@ -931,9 +1029,14 @@ function setPointerMode(mode) {
   document.body.appendChild(bar);
 })();
 
-// Config first, then connect. readPort() never throws — on any
-// problem with the file it returns the default port, so .catch isn't needed here
-// and its absence won't swallow an error.
-readPort(vncPort).then((p) => { vncPort = p; connect(); });
+// Config first, then connect. readTarget() never throws — on any problem with
+// the file it returns the default port, so .catch isn't needed here and its
+// absence won't swallow an error.
+// readTarget() never throws, but connect() runs INSIDE the then and constructs an
+// RFB and a channel. Without a catch a throw there becomes an unhandled
+// rejection: blank tab, and nothing in window.onerror to say why.
+readTarget(vncTarget.port)
+  .then((t) => { vncTarget = t; connect(); })
+  .catch((e) => { console.error("desktop: could not start", e); });
 refreshNative();
 updateFrame(); // initial insets/flush; the canvas radius follows once it renders

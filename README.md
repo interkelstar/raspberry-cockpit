@@ -57,7 +57,13 @@ The usual way to put a desktop in a browser is websockify — a separate service
 cockpit.channel({ payload: "stream", address: "127.0.0.1", port: vncPort, binary: true })
 ```
 
-Browser → `cockpit-ws` → stream channel → local VNC. Cockpit already authenticated the user through PAM, so **the VNC server runs with no authentication, bound to localhost only** — there is no route to it from outside, and nothing to log into twice.
+Browser → `cockpit-ws` → stream channel → local VNC. Cockpit already authenticated the user through PAM, so **the VNC server runs with no authentication** — there is nothing to log into twice.
+
+Which makes where it listens the whole of its security, and a loopback port is not enough. `127.0.0.1` closes the network, not the machine: an unauthenticated RFB port is connectable by every process of every UID on the box, and what that buys is keyboard and pointer injection into the live session plus a continuous view of it. So on Wayland the server listens on a **unix socket inside a directory this installer creates at mode 0700** — access becomes a file permission instead of an open door, and Cockpit's stream channel takes `unix` in place of `address`/`port`, so nothing is given up to gain it.
+
+Measured while doing this, and worth knowing if you rely on the usual assumption: `/run/user/1000` on Raspberry Pi OS is **770, not 700**, and `wayvnc` creates its socket **775** — so neither the runtime directory nor the socket's own mode would have kept group members out. Owning the parent directory is what settles it.
+
+The X11 path (`x0vncserver`) still uses a loopback port, so there any local process can drive it. `x0vncserver` documents `-rfbunixpath`, which would close it the same way, but there is no test board behind that path here and a wrong guess produces a unit that never starts. Stated rather than quietly assumed to be equivalent.
 
 A useful side effect: the plugin contains no reference to X11, Wayland, or any particular VNC server. It opens a stream and speaks RFB; where the pixels come from is invisible to it. The installer picks the server (`wayvnc` for Wayland, `x0vncserver` for X11) by detecting the **live session**, not by reading the distribution name.
 
@@ -156,6 +162,18 @@ Related, and the reason the scoping test is geometric: deciding "is this touch m
 
 **`systemctl enable --now` is a no-op on a running unit.** Re-running with a different `--port` rewrote both configs and left VNC on the old one — while reporting success. Needs an explicit `restart`.
 
+**`wayvnc` does not unlink a stale socket, and refuses to bind over one.** So the first install worked and every one after it did not: `Failed to listen on socket or bind to its address`, a restart loop, and a tab with nothing to connect to. `ExecStartPre` removes the socket before starting. Found by installing twice — which is the common case, not the rare one.
+
+**`StartLimitIntervalSec` and `StartLimitBurst` live in `[Unit]`, not `[Service]`.** Put in the wrong section they are ignored in silence, which is how a unit that could never start got to restart nineteen times.
+
+**A multi-finger tap had no slop at all.** `moved = true` on any two-finger `touchmove` looked harmless next to the pinch/scroll threshold three lines below it, and meant a single event of finger drift dropped the right click entirely — while a one-finger tap enjoyed twelve pixels of tolerance. Two fingers rarely rest perfectly still for the 60–250ms a tap takes. Found by review, reproduced by a test that inserts one `touchmove` into a two-finger tap; no test in either suite had done that.
+
+**Intercepting `Ctrl+<key>` without looking at Shift and Alt rewrites them.** `Ctrl+Shift+C` — how every Linux terminal copies — was arriving at the remote as a bare `Ctrl+C`, i.e. SIGINT to whatever was running. Modifiers now fall through untouched.
+
+**`stopGlide()` cannot unqueue a frame `requestAnimationFrame` has already accepted.** A flick completed inside one frame interval left the previous loop alive to find the *new* glide object and schedule itself again: two loops, one state, double speed and twice the traffic. A generation counter, not a null check.
+
+**`Display.viewportChangePos` floors its deltas and keeps no remainder**, and `Math.floor` is not symmetric about zero. At zoom 4 a slow push against the right edge asks for 0.275 framebuffer pixels and gets nothing, while the same push at the left edge floors to −1 and moves — the edge pan worked in one direction only. The fraction is carried now, and "did it move" is read back from the viewport origin rather than inferred from having asked.
+
 **Deleting the old output before regenerating it is not always the tidy choice.** The compression pass began by clearing every `.gz`, which reads as obviously correct and destroys the installation: noVNC is copied only when absent, so on the second run its sources are *already* compressed, and "delete all `.gz`, then compress every `.js`" removes sixty files and finds nothing to replace them with. Measured: 80 noVNC modules became 20, and the tab would have been blank. Stale output may only be deleted where staleness can actually be established.
 
 **A generator that reads its own output has to understand its own output.** The same second run collapsed the preload list from 49 entries to 5, because the walk that follows imports could read `x.js` but not `x.js.gz` and so stopped at the first already-installed module. It failed quietly, in the direction of doing less.
@@ -181,11 +199,13 @@ npm test                # node --test, no dependencies, ~0.2s
 npm run test:browser    # real touch input through real chromium, ~30s
 ```
 
+`test/bridge-channel.py <socket|port>` proves the transport itself, and `verify.sh` runs it: it asks **cockpit-bridge** to open the very channel the plugin opens and checks that an RFB banner comes back. Everything else can be checked from outside — the server runs, it speaks RFB, the files are installed and readable — but the link between them is where the assumptions live, and until this existed the only way to test it was to open the tab and type a password. cockpit-bridge speaks its protocol on stdio to whoever runs it, so this needs neither.
+
 `npm test` covers the two modules that hold decisions rather than DOM calls, and are separate files precisely so they can be tested: `desktop/config.js` (parsing) and `desktop/trackpad.js` (what counts as a tap, when a touch becomes a drag, how far the pointer travels per finger-pixel). `app.js` touches the DOM and noVNC on import and won't load under node.
 
-50 tests. Several are regression locks, and each was checked for its **ability to fail** — the fix removed, the suite run, exactly the expected test red. Two of them did not fail, which is how it came out that treating a hand-off between fingers as movement drops half of all right clicks: whichever finger leaves first is a coin toss.
+58 tests. Several are regression locks, and each was checked for its **ability to fail** — the fix removed, the suite run, exactly the expected test red. Two of them did not fail, which is how it came out that treating a hand-off between fingers as movement drops half of all right clicks: whichever finger leaves first is a coin toss.
 
-`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. 28 checks. It found a right click arriving as a middle click, a two-finger tap being silently dropped, a stray pointer grab that killed the toolbar, and zooming out shrinking the picture instead of showing more desktop. Note what it could *not* pin down: the exact arm window, because CDP round-trip latency swamps a 200ms difference. Timing constants are locked by the unit tests, which have an exact clock.
+`npm run test:browser` is the other half, because "the event was dispatched" is not evidence. It loads the real `app.js` against the real noVNC, speaks just enough RFB to bring the client up with a 1920×1080 framebuffer, feeds it **real browser touch events** over the DevTools Protocol, and decodes the pointer messages the client sends back — coordinates and button mask. 30 checks. It found a right click arriving as a middle click, a two-finger tap being silently dropped, a stray pointer grab that killed the toolbar, and zooming out shrinking the picture instead of showing more desktop. Note what it could *not* pin down: the exact arm window, because CDP round-trip latency swamps a 200ms difference. Timing constants are locked by the unit tests, which have an exact clock.
 
 ## A note on verification
 

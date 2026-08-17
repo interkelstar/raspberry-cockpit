@@ -23,10 +23,44 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The same guard get.sh has, and for the same reason — it belonged here all along.
+# get.sh refuses root because this script calls sudo itself and writes PER-USER
+# systemd units, and README documents the clone-and-run path, which had no check
+# at all. Under `sudo ./install.sh` HOME is /root: the unit lands in root's
+# manager, linger is enabled for root, the wayvnc config is written under /root,
+# and the graphical session it is supposed to capture belongs to somebody else.
+# The failure is quiet — a unit that never finds a session.
+if [ "$(id -u)" = 0 ]; then
+    printf '\n\033[31m✗ run as your normal user, not root — this script calls sudo where it needs to,\n' >&2
+    printf '   and the systemd units it writes are per-user ones that root would put in the\n' >&2
+    printf '   wrong place, watching a session that is not yours.\033[0m\n' >&2
+    exit 1
+fi
 PORT=5901; DRY=0; UNINSTALL=0
 ONLY="cockpit,files,desktop,branding"
 
+# One private scratch directory for the whole run, removed however we exit. There
+# was no trap at all: an abort between unpacking a tarball and cleaning up left it
+# in /tmp, and one step wrote a PREDICTABLE /tmp path that root then read back —
+# a local user could pre-create it world-writable and have root splice their text
+# into a page cockpit-ws serves.
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT INT TERM
+
 PLUGIN_DIR=/usr/share/cockpit/desktop
+# Written on install, checked before anything destructive. Without it the script
+# could not tell its own installation from somebody else's directory that happened
+# to be at the same path — and it compressed, deleted and uninstalled regardless.
+MARKER=.raspberry-cockpit
+# The socket lives in a directory WE create at 0700, not directly in
+# XDG_RUNTIME_DIR. Measured on Raspberry Pi OS: /run/user/1000 is 770, not the 700
+# it is often assumed to be, and wayvnc creates its socket 775 — so group members
+# could both traverse the directory and write to the socket, which for a no-auth
+# RFB server means driving the session. Owning the parent directory settles it
+# whatever mode the server picks for the socket itself.
+VNC_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/raspberry-cockpit"
+VNC_SOCK="$VNC_DIR/vnc.sock"
 FILES_DIR=/usr/share/cockpit/files
 CONFIG=/etc/cockpit/desktop.conf
 UNIT=raspberry-cockpit-vnc.service
@@ -73,12 +107,35 @@ if [ "$UNINSTALL" = 1 ]; then
     run "sudo rm -f /etc/systemd/system/raspberry-cockpit-branding.{path,service} /usr/local/bin/raspberry-cockpit-branding"
     run "sudo systemctl daemon-reload"
     # Put the distro's own branding back rather than leaving a gap.
-    if [ -d "$BRAND_SRC/.orig" ]; then
+    # $BRAND_DST too, not just the backup: removing cockpit-ws before removing its
+    # add-ons is an ordinary thing to do, and then `cp -a` fails, `run` is eval
+    # under `set -e`, and uninstall exits here — leaving everything below it in
+    # place with nothing but a bare cp error to explain why.
+    if [ -d "$BRAND_SRC/.orig" ] && [ -d "$BRAND_DST" ]; then
         run "sudo cp -a '$BRAND_SRC/.orig/.' '$BRAND_DST/'"
         ok "distro branding restored"
     fi
-    run "sudo rm -rf $PLUGIN_DIR $FILES_DIR $CONFIG /usr/local/share/raspberry-cockpit"
-    ok "removed. Packages are left alone — they may predate this script"
+
+    # Each removal has to establish that we are the ones who put it there.
+    # $FILES_DIR is exactly where the DISTRIBUTION package puts cockpit-files, and
+    # this script prefers that package when it exists — so an unconditional rm -rf
+    # deleted a dpkg-owned directory while the package database went on claiming it
+    # was installed. The stamp file distinguishes the two cases and was already
+    # being written; it simply was not consulted.
+    if [ -e "$FILES_DIR/.raspberry-cockpit-version" ]; then
+        run "sudo rm -rf $FILES_DIR /usr/share/metainfo/org.cockpit_project.files.metainfo.xml"
+        ok "file browser removed (it was ours)"
+    elif [ -d "$FILES_DIR" ]; then
+        warn "$FILES_DIR left alone — no install marker, so it is the distribution's"
+    fi
+    if [ -e "$PLUGIN_DIR/$MARKER" ]; then
+        run "sudo rm -rf $PLUGIN_DIR"
+        ok "desktop plugin removed"
+    elif [ -d "$PLUGIN_DIR" ]; then
+        warn "$PLUGIN_DIR left alone — no install marker, so something else owns it"
+    fi
+    run "sudo rm -rf $CONFIG /usr/local/share/raspberry-cockpit"
+    ok "done. Packages are left alone — they may predate this script"
     exit 0
 fi
 
@@ -142,7 +199,12 @@ if want cockpit; then
     fi
     # Login is by SYSTEM PASSWORD, not by ssh key. On a key-only box there may be
     # no password at all, and then the console installs but cannot be entered.
-    if [ "$(sudo passwd -S "$USER" 2>/dev/null | awk '{print $2}')" != P ]; then
+    # sudo -n, and skipped entirely in a dry run: --dry-run promises to touch
+    # nothing and this was prompting for a password, updating the sudo timestamp
+    # and writing an auth-log line.
+    if [ "$DRY" = 1 ]; then
+        skip "password check needs sudo — skipped in a dry run"
+    elif [ "$(sudo -n passwd -S "$USER" 2>/dev/null | awk '{print $2}')" != P ]; then
         warn "$USER has no password — you will not be able to log in. Set one: sudo passwd $USER"
     else
         ok "$USER has a password — login is possible"
@@ -154,7 +216,11 @@ fi
 # --- File browser -----------------------------------------------------------
 if want files; then
     say "File browser"
-    if $PKG show cockpit-files >/dev/null 2>&1 && \
+    # `apt show` exists; dnf and dnf5 call it `info`. With PKG=dnf this condition
+    # was always false, so Fedora — which does package cockpit-files — silently
+    # took the pinned third-party tarball and its manual-update path.
+    case "$PKG" in dnf) PKGQUERY="info" ;; *) PKGQUERY="show" ;; esac
+    if $PKG $PKGQUERY cockpit-files >/dev/null 2>&1 && \
        [ "$($PKG list cockpit-files 2>/dev/null | grep -c cockpit-files)" -gt 0 ] 2>/dev/null; then
         # If a distribution ever packages it, prefer the package: security
         # updates then arrive through the package manager instead of this pin.
@@ -166,14 +232,18 @@ if want files; then
     elif [ "$DRY" = 1 ]; then
         printf '   \033[90m[dry] download and unpack cockpit-files %s\033[0m\n' "$CF_VER"
     else
-        TMPD="$(mktemp -d)"
+        TMPD="$WORKDIR/cf"
+        mkdir -p "$TMPD"
         URL="https://github.com/cockpit-project/cockpit-files/releases/download/$CF_VER/cockpit-files-$CF_VER.tar.xz"
         if curl -fsSL -o "$TMPD/cf.tar.xz" "$URL"; then
             if [ "$(sha256sum "$TMPD/cf.tar.xz" | cut -d' ' -f1)" = "$CF_SHA" ]; then
                 tar xJf "$TMPD/cf.tar.xz" -C "$TMPD"
                 sudo install -d -m 0755 "$FILES_DIR"
-                sudo cp -r "$TMPD"/cockpit-files*/dist/. "$FILES_DIR/"
-                sudo chmod -R a+rX "$FILES_DIR"
+                # --no-preserve=mode: the tarball's own modes have no business in a
+                # root-owned directory the web console serves. a+rX adds read, and
+                # go-w takes away anything the archive thought should be writable.
+                sudo cp -r --no-preserve=mode "$TMPD"/cockpit-files*/dist/. "$FILES_DIR/"
+                sudo chmod -R a+rX,go-w "$FILES_DIR"
                 # metainfo is what the Applications tab builds its list from.
                 sudo install -m 0644 "$TMPD"/cockpit-files*/org.cockpit_project.files.metainfo.xml \
                     /usr/share/metainfo/ 2>/dev/null || true
@@ -186,7 +256,6 @@ if want files; then
         else
             warn "could not download cockpit-files (no network?) — skipping"
         fi
-        rm -rf "$TMPD"
     fi
 fi
 
@@ -235,7 +304,16 @@ if want desktop; then
             # --socket is required too: the control socket defaults to one shared
             # path while a machine easily runs several wayvnc instances (the test
             # board already had two — the system VNC and Raspberry Pi Connect).
-            EXEC="wayvnc --config=$WVCONF --socket=%t/raspberry-cockpit-wayvncctl --max-fps=30"
+            #
+            # --unix-socket is the security-relevant one. address=127.0.0.1 closes
+            # the network and NOT the machine: a no-auth RFB listener on loopback
+            # is connectable by every process of every UID on the box, and what it
+            # gets is pointer and keyboard injection plus a live view of the
+            # session. A socket inside XDG_RUNTIME_DIR (0700, owner only) makes
+            # that a filesystem permission instead of an open door, and Cockpit's
+            # stream channel takes "unix" in place of address/port, so nothing is
+            # given up to gain it.
+            EXEC="wayvnc --config=$WVCONF --unix-socket --socket=%t/raspberry-cockpit-wayvncctl --max-fps=30"
             ;;
         x11)
             BIN=x0vncserver
@@ -244,8 +322,14 @@ if want desktop; then
                 dnf) VPKG=tigervnc-server ;;
             esac
             # -localhost and SecurityTypes=None belong together: a server without
-            # authentication must not be reachable from outside, and it does not
-            # need to be, because the only way in is through Cockpit.
+            # authentication must not be reachable from off the machine.
+            #
+            # Unlike the Wayland path this stays on a loopback PORT, which means
+            # any local process can drive it, whatever its UID. x0vncserver does
+            # document -rfbunixpath/-rfbunixmode and that would close it the same
+            # way, but this path has no test board behind it and a wrong guess
+            # here fails as a unit that never starts. Stated plainly in the README
+            # rather than quietly assumed to be equivalent.
             EXEC="x0vncserver -display :0 -rfbport $PORT -SecurityTypes=None -localhost -SendPrimary=0"
             ;;
     esac
@@ -253,6 +337,7 @@ if want desktop; then
 
     if [ "$SESSION_TYPE" = wayland ]; then
         run "mkdir -p '$(dirname "$WVCONF")'"
+        run "install -d -m 0700 '$VNC_DIR'"
         if [ "$DRY" = 1 ]; then
             printf '   \033[90m[dry] write %s\033[0m\n' "$WVCONF"
         else
@@ -260,20 +345,30 @@ if want desktop; then
 # Written by raspberry-cockpit. No need to edit by hand.
 # wayvnc's format is flat key=value with NO sections: a line like "[wayvnc]"
 # breaks parsing entirely.
-address=127.0.0.1
-port=$PORT
+# With --unix-socket, "address" is the socket PATH. It sits in XDG_RUNTIME_DIR,
+# which is mode 0700, so the socket is reachable by this user and nobody else.
+address=$VNC_SOCK
 # No authentication, deliberately: the only route in is Cockpit's stream channel,
-# which already passed PAM. Security rests on address=127.0.0.1 — these two lines
-# must never be separated.
+# which already passed PAM. Security rests on the socket's permissions — these
+# two lines must never be separated.
 enable_auth=false
 WVEOF
         fi
-        ok "wayvnc config: $WVCONF (localhost only, no auth)"
+        ok "wayvnc config: $WVCONF (unix socket, owner only, no auth)"
     fi
 
-    if ss -tln 2>/dev/null | grep -qE "[.:]$PORT\b" && \
-       ! systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
-        die "port $PORT is already taken — pick another: --port $((PORT+1))"
+    # Only the port path can collide; a socket we own cannot be taken by someone
+    # else. Skipping the check whenever our own unit is active was wrong: the case
+    # that matters is a unit already running on 5901 while the user asks for 5902
+    # and something unrelated holds 5902. Compare against the port the running
+    # unit actually uses instead, so re-running unchanged is quiet and a real
+    # collision is not.
+    if [ "$SESSION_TYPE" != wayland ]; then
+        taken=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*[:.]//' | grep -Fx "$PORT" || true)
+        running=$(systemctl --user show -p ExecStart --value "$UNIT" 2>/dev/null | grep -oE 'rfbport [0-9]+' | grep -oE '[0-9]+' || true)
+        if [ -n "$taken" ] && [ "$running" != "$PORT" ]; then
+            die "port $PORT is already taken — pick another: --port $((PORT+1))"
+        fi
     fi
 
     # A user unit, not a system one: the VNC server must see its own user's
@@ -284,15 +379,29 @@ WVEOF
     else
         cat > "$HOME/.config/systemd/user/$UNIT" <<UNITEOF
 [Unit]
-Description=VNC for the Cockpit Desktop tab ($SESSION_TYPE, localhost only)
+Description=VNC for the Cockpit Desktop tab ($SESSION_TYPE, no auth, owner-only socket)
 After=graphical-session.target
 PartOf=graphical-session.target
+# In [Unit], where systemd actually reads them — in [Service] they are silently
+# ignored, which is how a failing unit got to restart nineteen times. Bounded, or
+# a box that boots without a graphical session respawns this every three seconds
+# for as long as it is powered on.
+StartLimitIntervalSec=120
+StartLimitBurst=8
 
 [Service]
 # The sh wrapper exists for one fallback line. Modern compositors export
 # WAYLAND_DISPLAY into the systemd user environment (labwc does), minimal setups
 # do not — and then wayvnc cannot find the session. Cheaper to supply it than to
 # debug "works for you, not for me" later.
+# The socket's directory, owner-only, recreated on every start because
+# XDG_RUNTIME_DIR is wiped when the last session ends — and the socket FILE
+# removed, because wayvnc does not unlink a stale one and refuses to bind over it:
+# "Failed to listen on socket or bind to its address". Every restart after the
+# first failed, the restart loop ran until the start limit stopped it, and the tab
+# had nothing to connect to. Found by installing twice; the second install is the
+# common case, not the rare one.
+ExecStartPre=/bin/sh -c 'install -d -m 0700 "%t/raspberry-cockpit" && rm -f "%t/raspberry-cockpit/vnc.sock"'
 ExecStart=/bin/sh -c '[ -n "\$WAYLAND_DISPLAY" ] || [ "$SESSION_TYPE" != wayland ] || export WAYLAND_DISPLAY="\$(basename "\$(ls "\$XDG_RUNTIME_DIR"/wayland-[0-9] 2>/dev/null | head -1)")"; exec $EXEC'
 Restart=always
 RestartSec=3
@@ -308,12 +417,49 @@ UNITEOF
     # and leave VNC on the old port — while reporting success.
     run "systemctl --user restart $UNIT"
     run "sudo loginctl enable-linger $USER"
-    ok "$UNIT up: 127.0.0.1:$PORT, no auth, not listening outside"
+    # Say it started because it started. The old line asserted the address and
+    # port unconditionally, so a server that failed to bind and went into the
+    # restart loop still printed a tick — the same "reports success, tab is blank"
+    # this file keeps running into.
+    if [ "$DRY" = 1 ]; then
+        ok "$UNIT would be started"
+    elif systemctl --user is-active --quiet "$UNIT"; then
+        if [ "$SESSION_TYPE" = wayland ]; then
+            ok "$UNIT up on $VNC_SOCK (owner only, no auth)"
+        else
+            ok "$UNIT up on 127.0.0.1:$PORT (no auth, not listening outside)"
+        fi
+    else
+        die "$UNIT did not start — systemctl --user status $UNIT, journalctl --user -u $UNIT"
+    fi
 
     # EXPLICIT 0755 on the package directory. cockpit-ws serves static resources
     # as a NON-root user, so a directory created under a strict umask (077 in a
     # sudo/systemd context) would be 0700 and the browser would 403 on every file.
+    # Refuse a directory that exists and is not ours. `install -d` succeeds on an
+    # existing one, and everything after this point rewrites its contents: the
+    # compression pass gzips every .js it finds (gzip REMOVES the original) and
+    # then deletes every top-level .gz whose name is not in our desktop/. Pointed
+    # at a stranger's Cockpit module that is not an installation, it is a deletion.
+    if [ -d "$PLUGIN_DIR" ] && [ ! -e "$PLUGIN_DIR/$MARKER" ] && [ "$DRY" != 1 ]; then
+        # An installation from before the marker existed still has to be
+        # upgradable, so adopt a directory that is recognisably this plugin: our
+        # own app.js, under either name, beside our manifest.
+        if { [ -e "$PLUGIN_DIR/app.js" ] || [ -e "$PLUGIN_DIR/app.js.gz" ]; } \
+           && [ -e "$PLUGIN_DIR/manifest.json" ] \
+           && grep -q '"desktop"' "$PLUGIN_DIR/manifest.json" 2>/dev/null; then
+            skip "adopting the existing install (predates the ownership marker)"
+        else
+            die "$PLUGIN_DIR already exists and was not installed by this script.
+   Move it aside if you want it replaced — refusing to rewrite files that are not ours."
+        fi
+    fi
     run "sudo install -d -m 0755 $PLUGIN_DIR"
+    if [ "$DRY" != 1 ]; then
+        printf 'Installed by raspberry-cockpit. Removing this file makes uninstall refuse to touch this directory.\n' \
+            | sudo tee "$PLUGIN_DIR/$MARKER" >/dev/null
+        sudo chmod 0644 "$PLUGIN_DIR/$MARKER"
+    fi
     if [ ! -d /usr/share/novnc ]; then run "sudo $PKG install -y novnc"; fi
     [ "$DRY" = 1 ] || [ -d /usr/share/novnc ] || die "no /usr/share/novnc — install the novnc package"
     # The noVNC client comes from the distribution rather than being vendored, so
@@ -321,6 +467,14 @@ UNITEOF
     # absent: re-copying on every run blinks the live desktop.
     if [ ! -d "$PLUGIN_DIR/novnc" ]; then
         run "sudo cp -r /usr/share/novnc $PLUGIN_DIR/novnc"
+        # The 0755 above covers ONE directory. cp -r creates several hundred files
+        # and a dozen directories under root's umask, and the comment above about
+        # 403s applies to every one of them: with umask 077 in effect — pam_umask,
+        # or an install driven from a unit or cloud-init — the whole module graph
+        # comes out 0700/0600 and cockpit-ws, which serves as a non-root user,
+        # refuses the lot. Blank tab, installer green. The file-browser path
+        # already did this; this one did not.
+        run "sudo chmod -R a+rX,go-w '$PLUGIN_DIR/novnc'"
         ok "noVNC client copied from /usr/share/novnc"
     else
         skip "noVNC client already present"
@@ -334,7 +488,7 @@ UNITEOF
         run "sudo install -m 0644 '$f' '$PLUGIN_DIR/$(basename "$f")'"
     done
     run "sudo chmod 0755 $PLUGIN_DIR"
-    ok "plugin installed in $PLUGIN_DIR ($(ls -1 "$SRC"/desktop | wc -l) files)"
+    ok "plugin installed in $PLUGIN_DIR ($(find "$SRC"/desktop -maxdepth 1 -type f | wc -l) files)"
 
     # noVNC is ~54 ES modules and half a megabyte of JavaScript, and the browser
     # discovers them in waves: index.html finds app.js, app.js finds rfb.js,
@@ -351,8 +505,8 @@ UNITEOF
     else
         graph="$(module_graph "$PLUGIN_DIR")"
         links="$(printf '%s\n' "$graph" | sed 's|.*|  <link rel="modulepreload" href="&">|')"
-        printf '%s\n' "$links" > /tmp/rc-preload.$$
-        sudo python3 - "$PLUGIN_DIR/index.html" /tmp/rc-preload.$$ <<'PYEOF'
+        printf '%s\n' "$links" > "$WORKDIR/preload.html"
+        sudo python3 - "$PLUGIN_DIR/index.html" "$WORKDIR/preload.html" <<'PYEOF'
 import sys, re
 page, links = sys.argv[1], sys.argv[2]
 html = open(page).read()
@@ -360,7 +514,6 @@ html = re.sub(r'\n?\s*<link rel="modulepreload"[^>]*>', '', html)
 html = html.replace("</head>", open(links).read() + "</head>", 1)
 open(page, "w").write(html)
 PYEOF
-        rm -f /tmp/rc-preload.$$
         ok "$(printf '%s\n' "$graph" | wc -l) modules preloaded from index.html"
     fi
 
@@ -394,7 +547,7 @@ PYEOF
         # compressing "every .js" removes sixty files and finds nothing to replace
         # them with. Measured, before this line was written the way it is now: 80
         # noVNC modules became 20.
-        before=$(sudo du -sk "$PLUGIN_DIR" | cut -f1)
+        before=$(du -sk "$PLUGIN_DIR" | cut -f1)
         sudo find "$PLUGIN_DIR" \( -name '*.js' -o -name '*.css' \) -exec gzip -9 -f {} +
         # Stale output is still worth removing, but only where we can tell it IS
         # stale: our own files, whose source list is right here.
@@ -403,18 +556,27 @@ PYEOF
             b="$(basename "${g%.gz}")"
             [ -e "$SRC/desktop/$b" ] || run "sudo rm -f '$g'"
         done
-        after=$(sudo du -sk "$PLUGIN_DIR" | cut -f1)
-        ok "compressed for cockpit-ws ($(sudo find "$PLUGIN_DIR" -name '*.gz' | wc -l) files, ${before}kB -> ${after}kB)"
+        after=$(du -sk "$PLUGIN_DIR" | cut -f1)
+        ok "compressed for cockpit-ws ($(find "$PLUGIN_DIR" -name '*.gz' | wc -l) files, ${before}kB -> ${after}kB)"
     fi
 
     run "sudo install -d -m 0755 /etc/cockpit"
     if [ "$DRY" = 1 ]; then
-        printf '   \033[90m[dry] write %s (port=%s)\033[0m\n' "$CONFIG" "$PORT"
+        if [ "$SESSION_TYPE" = wayland ]; then
+            printf '   \033[90m[dry] write %s (socket=%s)\033[0m\n' "$CONFIG" "$VNC_SOCK"
+        else
+            printf '   \033[90m[dry] write %s (port=%s)\033[0m\n' "$CONFIG" "$PORT"
+        fi
     else
-        printf '# VNC port for the Cockpit Desktop tab. Read when the tab loads.\nport=%s\n' "$PORT" \
-            | sudo tee "$CONFIG" >/dev/null
+        if [ "$SESSION_TYPE" = wayland ]; then
+            printf '# Where the Cockpit Desktop tab finds VNC. Read when the tab loads.\n# A unix socket: reachable by its owner, not by every local process.\nsocket=%s\n' \
+                "$VNC_SOCK" | sudo tee "$CONFIG" >/dev/null
+        else
+            printf '# Where the Cockpit Desktop tab finds VNC. Read when the tab loads.\nport=%s\n' "$PORT" \
+                | sudo tee "$CONFIG" >/dev/null
+        fi
     fi
-    ok "$CONFIG: port=$PORT"
+    if [ "$SESSION_TYPE" = wayland ]; then ok "$CONFIG: socket=$VNC_SOCK"; else ok "$CONFIG: port=$PORT"; fi
 fi
 
 # --- Branding ---------------------------------------------------------------

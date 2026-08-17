@@ -247,7 +247,6 @@ export function createTrackpad() {
                 // without that shift being read as travel.
                 const c = centroid(points);
                 const d = spread(points);
-                moved = true;
 
                 if (twoMode === null && twoFrom) {
                     const dGap = Math.abs(d - twoFrom.spread);
@@ -255,6 +254,13 @@ export function createTrackpad() {
                     if (dGap > PINCH_SLOP && dGap > dMid) twoMode = "pinch";
                     else if (dMid > TAP_SLOP) twoMode = "scroll";
                 }
+                // `moved` only once the gesture has actually been classified.
+                // Setting it on any two-finger touchmove gave multi-finger taps
+                // ZERO slop where a one-finger tap gets TAP_SLOP: a single event
+                // of finger drift — which a real two-finger tap produces, since
+                // two fingers rarely rest perfectly still for the 60-250ms it
+                // lasts — dropped the right click entirely, silently.
+                if (twoMode !== null) moved = true;
 
                 if (twoMode === "pinch") {
                     if (prevSpread > 0 && d > 0 && d !== prevSpread) {

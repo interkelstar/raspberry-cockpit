@@ -88,3 +88,9 @@ window.__touch = []; window.__intents = [];
 for (const t of ["touchstart","touchmove","touchend","touchcancel"])
   document.addEventListener(t, (e) => window.__touch.push(t + ":" + e.touches.length + "[" + [...e.touches].map(x=>x.identifier).join(",") + "]"), true);
 window.onerror = (m, s, l) => { window.__log.push("ERROR " + m + " @" + l); };
+// onerror does NOT fire for a rejected promise, and the plugin's whole startup is
+// a promise chain — so the "no page errors" check could pass straight through a
+// blank tab.
+window.addEventListener("unhandledrejection", (e) => {
+  window.__log.push("UNHANDLED REJECTION " + ((e.reason && e.reason.message) || e.reason));
+});

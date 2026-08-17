@@ -73,6 +73,13 @@ grep -q 'src="stub.js"' "$WORK/index.html" || die "could not substitute the cock
 sed -i 's|^function runIntents(list) {|function runIntents(list) {\n  if (window.__intents \&\& list.length) window.__intents.push(...list.map(i => i.t + (i.button !== undefined ? ":" + i.button : "")));|' "$WORK/app.js"
 grep -q "__intents" "$WORK/app.js" || die "could not install the diagnostic shim — has runIntents been renamed?"
 
+# Refuse a port somebody else holds. The readiness probe below cannot tell our
+# chromium from a leftover one or from a developer's own remote-debugging session,
+# and driving the wrong browser gives either a hang or a meaningless result.
+if curl -sf "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; then
+    die "something already answers on CDP port $CDP_PORT — close it, or set CDP_PORT=..."
+fi
+
 say "Starting chromium"
 # --allow-file-access-from-files and --disable-web-security: the page is an ES
 # module graph loaded over file://, which is cross-origin to itself otherwise.

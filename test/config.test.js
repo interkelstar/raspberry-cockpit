@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parsePort, DEFAULT_PORT } from "../desktop/config.js";
+import { parsePort, parseSocket, DEFAULT_PORT } from "../desktop/config.js";
 
 test("reads the port from what the installer actually writes", () => {
     const written = "# VNC port for the Cockpit Desktop tab. Read when the tab loads.\nport=5902\n";
@@ -58,4 +58,29 @@ test("an explicit fallback overrides the default", () => {
 // whether it appended or replaced.
 test("with two keys the first wins — pinned deliberately", () => {
     assert.equal(parsePort("port=5901\nport=5902\n"), 5901);
+});
+
+// --- socket ----------------------------------------------------------------
+
+test("a socket path is read when the installer wrote one", () => {
+    assert.equal(parseSocket("socket=/run/user/1000/rc-vnc.sock\n"), "/run/user/1000/rc-vnc.sock");
+});
+
+test("no socket line means no socket", () => {
+    assert.equal(parseSocket("port=5901\n"), null);
+    assert.equal(parseSocket(""), null);
+    assert.equal(parseSocket(undefined), null);
+});
+
+// The value becomes the target of a Cockpit stream channel, so a relative or
+// empty path must fall back to the port rather than open something unintended.
+test("only an absolute path counts as a socket", () => {
+    assert.equal(parseSocket("socket=rc-vnc.sock\n"), null);
+    assert.equal(parseSocket("socket=\n"), null);
+    assert.equal(parseSocket("socket=   \n"), null);
+});
+
+// Same anchoring rule as the port: a commented-out line is not a setting.
+test("a commented-out socket is not a socket", () => {
+    assert.equal(parseSocket("#socket=/run/user/1000/rc-vnc.sock\n"), null);
 });
