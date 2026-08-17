@@ -752,15 +752,22 @@ function runIntents(list) {
 // ev.timeStamp, so the timer-driven ticks below sit on the same clock.
 const eventTime = (ev) => (typeof ev.timeStamp === "number" && ev.timeStamp > 0 ? ev.timeStamp : performance.now());
 
-function armLongPress() {
+// Both timers are scheduled relative to the EVENT's time, not to the moment the
+// handler happened to run. The recogniser measures elapsed time from the event, so
+// a timer that waits the full interval from the handler waits too long by however
+// late the handler was — and on a busy main thread that is exactly when it is
+// late. Subtracting the delay that has already passed makes the two agree.
+function armLongPress(at) {
   clearTimeout(longPressTimer);
-  longPressTimer = setTimeout(() => runIntents(trackpad.tick(performance.now())), LONG_PRESS_MS + 20);
+  const left = Math.max(0, LONG_PRESS_MS + 20 - (performance.now() - at));
+  longPressTimer = setTimeout(() => runIntents(trackpad.tick(performance.now())), left);
 }
 // A tap's click is held back in case a drag follows. If none does, nothing else
 // would ever send it — hence a timer, not a hope.
-function armFlush() {
+function armFlush(at) {
   clearTimeout(flushTimer);
-  flushTimer = setTimeout(() => runIntents(trackpad.flush(performance.now())), TAP_HOLD_MS + 20);
+  const left = Math.max(0, TAP_HOLD_MS + 20 - (performance.now() - at));
+  flushTimer = setTimeout(() => runIntents(trackpad.flush(performance.now())), left);
 }
 
 function points(ev) {
@@ -842,13 +849,13 @@ function handleTouch(ev) {
   const pts = points(ev);
   if (ev.type === "touchstart") {
     runIntents(trackpad.touchStart(pts, now));
-    armLongPress();
+    armLongPress(now);
   } else if (ev.type === "touchmove") {
     runIntents(trackpad.touchMove(pts, now));
   } else if (ev.type === "touchend") {
     runIntents(trackpad.touchEnd(pts, now));
     if (!trackpad.active) clearTimeout(longPressTimer);
-    armFlush();
+    armFlush(now);
   } else {
     runIntents(trackpad.cancel());
     clearTimeout(longPressTimer);

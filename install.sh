@@ -139,31 +139,6 @@ if [ "$UNINSTALL" = 1 ]; then
     exit 0
 fi
 
-# Every module reachable from app.js, as paths relative to the plugin directory.
-# Derived by following the imports rather than listed by hand, for the same reason
-# the file copy is: a hand-written list is a list that goes stale silently.
-module_graph() {
-    local dir="$1" queue="app.js" seen="" cur spec res
-    while [ -n "$queue" ]; do
-        cur="${queue%%$'\n'*}"
-        case "$queue" in *$'\n'*) queue="${queue#*$'\n'}" ;; *) queue="" ;; esac
-        case $'\n'"$seen"$'\n' in *$'\n'"$cur"$'\n'*) continue ;; esac
-        seen="${seen:+$seen$'\n'}$cur"
-        # A module already installed is a COMPRESSED module: reading only the plain
-        # name made this walk stop at the first noVNC file on every run after the
-        # first, and the preload list silently shrank from 49 entries to 5.
-        if [ -f "$dir/$cur" ]; then read_cur() { cat "$dir/$cur"; }
-        elif [ -f "$dir/$cur.gz" ]; then read_cur() { zcat "$dir/$cur.gz"; }
-        else continue
-        fi
-        for spec in $(read_cur | grep -oE '(from|import)[[:space:]]*"\.[^"]+"' | sed 's/.*"\(.*\)"/\1/' | sort -u); do
-            res="$(cd "$dir/$(dirname "$cur")" 2>/dev/null && realpath -m --relative-to="$dir" "$spec")" || continue
-            queue="${queue:+$queue$'\n'}$res"
-        done
-    done
-    printf '%s\n' "$seen"
-}
-
 # --- Preconditions ----------------------------------------------------------
 say "Checks"
 
@@ -490,33 +465,21 @@ UNITEOF
     run "sudo chmod 0755 $PLUGIN_DIR"
     ok "plugin installed in $PLUGIN_DIR ($(find "$SRC"/desktop -maxdepth 1 -type f | wc -l) files)"
 
-    # noVNC is ~54 ES modules and half a megabyte of JavaScript, and the browser
-    # discovers them in waves: index.html finds app.js, app.js finds rfb.js,
-    # rfb.js finds twenty more, and so on. Every wave costs a round trip before
-    # the next one can even start. Naming the whole graph up front collapses that
-    # into one wave of parallel fetches.
+    # There was a modulepreload pass here, naming all 49 modules in index.html so
+    # the browser would not discover them in waves. It is REMOVED, because it made
+    # the thing it was meant to fix worse.
     #
-    # This is injected into the INSTALLED copy rather than kept in the repository
-    # because the list is whatever noVNC happens to ship on this machine. It is a
-    # transport hint with no effect on behaviour, which is why the test harness
-    # can go on building its page from the repository's index.html.
-    if [ "$DRY" = 1 ]; then
-        printf '   \033[90m[dry] inject modulepreload links into %s/index.html\033[0m\n' "$PLUGIN_DIR"
-    else
-        graph="$(module_graph "$PLUGIN_DIR")"
-        links="$(printf '%s\n' "$graph" | sed 's|.*|  <link rel="modulepreload" href="&">|')"
-        printf '%s\n' "$links" > "$WORKDIR/preload.html"
-        sudo python3 - "$PLUGIN_DIR/index.html" "$WORKDIR/preload.html" <<'PYEOF'
-import sys, re
-page, links = sys.argv[1], sys.argv[2]
-html = open(page).read()
-html = re.sub(r'\n?\s*<link rel="modulepreload"[^>]*>', '', html)
-html = html.replace("</head>", open(links).read() + "</head>", 1)
-open(page, "w").write(html)
-PYEOF
-        ok "$(printf '%s\n' "$graph" | wc -l) modules preloaded from index.html"
-    fi
-
+    # cockpit-ws speaks HTTP/1.1, so a browser has roughly six connections per
+    # host. Forty-nine preload links in the <head> are queued before the parser
+    # ever reaches ../base1/cockpit.js in the body — and nothing in the tab happens
+    # until that script has loaded, because it is what opens the channel. Over a
+    # tunnel the result was cockpit.js waiting behind the module graph for long
+    # enough to look hung; it was reported as exactly that, from a network panel.
+    #
+    # Compression stays: fewer bytes helps on any connection and cannot reorder
+    # anything. The waves cost a few round trips, which is a price worth paying to
+    # keep the critical path first. If Cockpit ever serves HTTP/2, this is worth
+    # revisiting — there the preloads would cost nothing.
     # Cockpit serves a package file named `x.js.gz` in answer to a request for
     # `x.js`, with Content-Encoding: gzip. From src/cockpit/packages.py:
     #

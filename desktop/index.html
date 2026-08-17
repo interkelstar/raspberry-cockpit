@@ -7,10 +7,15 @@
        handle ourselves. -->
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <link rel="stylesheet" href="style.css">
+  <!-- FIRST, and in the head. Nothing here works until cockpit.js has loaded: it
+       is what opens the channel to VNC, and Cockpit's shell shows its own spinner
+       until the frame's transport is up. cockpit-ws speaks HTTP/1.1, so the
+       browser has about six connections to play with — anything queued ahead of
+       this script is queued ahead of the whole tab. -->
+  <script src="../base1/cockpit.js"></script>
 </head>
 <body>
   <div id="screen"></div>
-  <script src="../base1/cockpit.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

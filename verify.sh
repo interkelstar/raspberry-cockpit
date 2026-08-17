@@ -117,17 +117,16 @@ else
             && ok "import ./$dep resolves" || bad "app.js imports ./$dep, which is absent"
     done < <($reader "$app" 2>/dev/null | grep -oE 'from "\./[^"]+"' | sed 's|from "\./||; s|"$||')
 
-    # Every module the page will pull must be named up front, or the browser
-    # discovers them in waves and pays a round trip for each wave.
-    # grep -c prints 0 and ALSO exits 1 when there is no match, so `|| echo 0`
-    # fired too and $pre became "0\n0" — which is not an integer expression, so
-    # the test printed a bash error and "preloads only 0 0 modules" at exactly the
-    # moment someone is reading a diagnosis.
-    pre=0
-    [ -f "$PLUGIN_DIR/index.html" ] && pre=$(grep -c 'rel="modulepreload"' "$PLUGIN_DIR/index.html" 2>/dev/null || true)
-    pre=${pre:-0}
-    [ "$pre" -gt 20 ] && ok "index.html preloads the module graph ($pre modules)" \
-                      || bad "index.html preloads only $pre modules — the graph is not being named up front"
+    # The page must ask for cockpit.js BEFORE anything else it needs. Over
+    # HTTP/1.1 whatever is queued ahead of it is queued ahead of the whole tab.
+    if [ -f "$PLUGIN_DIR/index.html" ]; then
+        order=$(grep -nE 'base1/cockpit\.js|rel="modulepreload"|type="module"' "$PLUGIN_DIR/index.html" | head -1)
+        case "$order" in
+            *base1/cockpit.js*) ok "index.html requests cockpit.js first" ;;
+            "") bad "index.html does not load cockpit.js at all" ;;
+            *) bad "something is queued ahead of cockpit.js: ${order#*:}" ;;
+        esac
+    fi
 
     if [ -r "$CONFIG" ]; then
         sock=$(grep -oE '^[ \t]*socket[ \t]*=[ \t]*/[^[:space:]#]+' "$CONFIG" | sed 's|.*=[ \t]*||' || true)

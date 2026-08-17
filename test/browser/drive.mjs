@@ -93,10 +93,30 @@ const reset = () => evaluate("window.__sent.length = 0; window.__touch.length = 
 // A left tap's click is held back by TAP_HOLD_MS in case a drag follows, so
 // reading the wire immediately after a tap would read it before the click.
 const TAP_HOLD_MS = 400;
-// Generously past TAP_HOLD_MS. The flush timer starts when the touchend HANDLER
-// runs, not when the event was dispatched, so a slow round trip pushes it later —
-// and at +120ms this raced it and read an empty wire perhaps one run in three.
-const sent = async () => { await sleep(TAP_HOLD_MS + 400); return evaluate("window.__sent"); };
+// Waits for the wire to go QUIET rather than for a fixed interval. A held-back
+// click arrives TAP_HOLD_MS after the touchend HANDLER ran — not after the event
+// was dispatched — so any fixed wait races a slow round trip, and a longer one
+// only makes the race rarer. Two identical reads in a row means nothing more is
+// coming; the ceiling stops a genuinely broken run from hanging here.
+// Waits for at least `min` messages and then for the wire to go QUIET, rather
+// than for a fixed interval. A held-back click arrives TAP_HOLD_MS after the
+// touchend HANDLER ran — not after the event was dispatched — so any fixed wait
+// races a slow round trip, and a longer one only makes the race rarer.
+//
+// The `min` is what makes the wait honest. Quiescence alone cannot tell "nothing
+// is coming" from "nothing yet", so an empty buffer looked settled and the check
+// read it before the click existed. Callers that expect nothing pass 0.
+async function sent(min = 1) {
+  let prev = -1, quiet = 0;
+  for (let i = 0; i < 40; i++) {
+    await sleep(120);
+    const n = await evaluate("window.__sent.length");
+    quiet = n === prev ? quiet + 1 : 0;
+    prev = n;
+    if (n >= min && quiet >= 2) break;
+  }
+  return evaluate("window.__sent");
+}
 
 const results = [];
 function check(name, ok, detail) {
@@ -171,9 +191,12 @@ await burst([
   ["touchMove", [{ id: 1, x: mid.x + 15, y: mid.y }]],
 ]);
 for (let i = 1; i <= 8; i++) await tp("touchMove", [{ id: 1, x: mid.x + 15 + i * 10, y: mid.y }]);
-// Read the wire BEFORE releasing. A release at speed hands the pointer a coast,
-// and the extra travel would be measured as if the finger had caused it.
-const slide = await sent();
+// Read the wire BEFORE releasing — a release at speed hands the pointer a coast,
+// and the extra travel would be measured as if the finger had caused it. A SHORT
+// fixed wait, not the quiesce loop: pointer moves are never held back, and leaving
+// the finger down for seconds while polling would turn this into a long press.
+await sleep(200);
+const slide = await evaluate("window.__sent");
 await tp("touchEnd", []);
 const moves = slide.filter((m) => m.mask === 0);
 const travelled = moves.length ? moves[moves.length - 1].x - moves[0].x : 0;
@@ -346,10 +369,16 @@ const dir = whereX < (rect.x + rect.w / 2) ? 1 : -1;
 // an unrealistically fast release from being unrealistic in its effect too.
 const from = Math.round(mid.x - dir * 60);
 const t0 = await evaluate("performance.now()");
+// A short, unmistakably fast release: most of the travel in the last few
+// milliseconds, so even if the browser coalesces two touchmoves into one the
+// remaining sample is still far above the flick threshold — and the total finger
+// travel stays small, so the pointer does not reach the edge before letting go
+// and leaves the coast somewhere to go.
 await tpAt("touchStart", [{ id: 1, x: from, y: mid.y }], t0);
-await tpAt("touchMove", [{ id: 1, x: from + dir * 20, y: mid.y }], t0 + 16);
-await tpAt("touchMove", [{ id: 1, x: from + dir * 60, y: mid.y }], t0 + 32);
-await tpAt("touchEnd", [], t0 + 40);
+await tpAt("touchMove", [{ id: 1, x: from + dir * 10, y: mid.y }], t0 + 16);
+await tpAt("touchMove", [{ id: 1, x: from + dir * 22, y: mid.y }], t0 + 32);
+await tpAt("touchMove", [{ id: 1, x: from + dir * 60, y: mid.y }], t0 + 40);
+await tpAt("touchEnd", [], t0 + 46);
 // Counted rather than measured. Acceleration plus a coast can cross the whole
 // 1920px framebuffer, and a clamped pointer keeps reporting the same coordinate —
 // so position proves nothing at the edges while the flow of updates proves both
@@ -387,20 +416,24 @@ check("there is letterbox above the fitted desktop to tap on", bar0.y > 4,
 if (bar0.y > 4) {
   await tp("touchStart", [{ id: 1, ...bar0 }], 70);
   await tp("touchEnd", [], 250);
-  const strays = await sent();
+  const strays = await sent(0);
   check("a tap on the letterbox does nothing at all", strays.length === 0, JSON.stringify(strays));
 }
 
 // Two fingers sliding -> wheel. noVNC turns wheel into buttons 4/5 (mask 8/16).
 await settle();
 await reset();
-await tp("touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }]);
-await tp("touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }, { id: 2, x: mid.x + 20, y: mid.y }]);
+// Stated times. Paced by round trip, the gap between the first finger and the
+// second could exceed LONG_PRESS_MS, the long press fired on the single finger,
+// and the scroll then arrived with a button held — [1,17,0] instead of [16,0].
+t1 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }], t1);
+await tpAt("touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }, { id: 2, x: mid.x + 20, y: mid.y }], t1 + 30);
 for (let i = 1; i <= 10; i++) {
-  await tp("touchMove", [{ id: 1, x: mid.x - 20, y: mid.y - i * 12 }, { id: 2, x: mid.x + 20, y: mid.y - i * 12 }]);
+  await tpAt("touchMove", [{ id: 1, x: mid.x - 20, y: mid.y - i * 12 }, { id: 2, x: mid.x + 20, y: mid.y - i * 12 }], t1 + 30 + i * 25);
 }
-await tp("touchEnd", [{ id: 1, x: mid.x - 20, y: mid.y - 120 }]);
-await tp("touchEnd", []);
+await tpAt("touchEnd", [{ id: 1, x: mid.x - 20, y: mid.y - 120 }], t1 + 300);
+await tpAt("touchEnd", [], t1 + 320);
 const scroll = await sent();
 check("two fingers scroll (noVNC wheel buttons 4/5)",
       scroll.some((m) => m.mask === 8 || m.mask === 16),
