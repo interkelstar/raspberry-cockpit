@@ -93,7 +93,10 @@ const reset = () => evaluate("window.__sent.length = 0; window.__touch.length = 
 // A left tap's click is held back by TAP_HOLD_MS in case a drag follows, so
 // reading the wire immediately after a tap would read it before the click.
 const TAP_HOLD_MS = 400;
-const sent = async () => { await sleep(TAP_HOLD_MS + 120); return evaluate("window.__sent"); };
+// Generously past TAP_HOLD_MS. The flush timer starts when the touchend HANDLER
+// runs, not when the event was dispatched, so a slow round trip pushes it later —
+// and at +120ms this raced it and read an empty wire perhaps one run in three.
+const sent = async () => { await sleep(TAP_HOLD_MS + 400); return evaluate("window.__sent"); };
 
 const results = [];
 function check(name, ok, detail) {
@@ -184,14 +187,20 @@ check("a slide alone presses no button", slide.every((m) => m.mask === 0),
       JSON.stringify(slide.filter((m) => m.mask)) + " intents=" + JSON.stringify(await intents()));
 
 // A tap clicks where the POINTER is, not under the finger.
+await settle();
 await reset();
+// Stated times again: paced by round trip, a 70ms tap became a 400ms one whenever
+// the machine was busy, which is a long press, and the check failed for a reason
+// that had nothing to do with taps.
 const far = { x: Math.round(rect.x + 25), y: Math.round(rect.y + rect.h - 25) };
-await tp("touchStart", [{ id: 1, ...far }]);
-await tp("touchEnd", []);
+let t1 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, ...far }], t1);
+await tpAt("touchEnd", [], t1 + 70);
 const tap = await sent();
 const down = tap.find((m) => m.mask === 1);
 check("a tap presses and releases the left button",
-      !!down && tap[tap.length - 1].mask === 0 && tap.length >= 2, JSON.stringify(tap));
+      !!down && tap[tap.length - 1].mask === 0 && tap.length >= 2,
+      JSON.stringify(tap));
 check("the click lands at the pointer, NOT under the finger",
       !!down && Math.abs(down.x - toRemoteX(far.x)) > 200,
       down ? `click x=${down.x}, finger was at x=${toRemoteX(far.x)}` : "no click");
@@ -199,12 +208,11 @@ check("the click lands at the pointer, NOT under the finger",
 // Two fingers tapped together -> right button (mask 1<<2 = 4).
 await settle();
 await reset();
-await burst([
-  ["touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }]],
-  ["touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }, { id: 2, x: mid.x + 20, y: mid.y }]],
-  ["touchEnd", [{ id: 1, x: mid.x - 20, y: mid.y }]],
-  ["touchEnd", []],
-]);
+t1 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }], t1);
+await tpAt("touchStart", [{ id: 1, x: mid.x - 20, y: mid.y }, { id: 2, x: mid.x + 20, y: mid.y }], t1 + 30);
+await tpAt("touchEnd", [{ id: 1, x: mid.x - 20, y: mid.y }], t1 + 120);
+await tpAt("touchEnd", [], t1 + 140);
 const two = await sent();
 check("a two-finger tap is a right click", two.some((m) => m.mask === 4),
       JSON.stringify(two) + " touches=" + JSON.stringify(await evaluate("window.__touch")) + " intents=" + JSON.stringify(await evaluate("window.__intents")));
@@ -215,14 +223,13 @@ check("a two-finger tap is a right click", two.some((m) => m.mask === 4),
 // the right-click check above would still pass.
 await settle();
 await reset();
-await burst([
-  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }]],
-  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x, y: mid.y }]],
-  ["touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x, y: mid.y }, { id: 3, x: mid.x + 40, y: mid.y }]],
-  ["touchEnd", [{ id: 2, x: mid.x, y: mid.y }, { id: 3, x: mid.x + 40, y: mid.y }]],
-  ["touchEnd", [{ id: 3, x: mid.x + 40, y: mid.y }]],
-  ["touchEnd", []],
-]);
+t1 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }], t1);
+await tpAt("touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x, y: mid.y }], t1 + 25);
+await tpAt("touchStart", [{ id: 1, x: mid.x - 40, y: mid.y }, { id: 2, x: mid.x, y: mid.y }, { id: 3, x: mid.x + 40, y: mid.y }], t1 + 50);
+await tpAt("touchEnd", [{ id: 2, x: mid.x, y: mid.y }, { id: 3, x: mid.x + 40, y: mid.y }], t1 + 140);
+await tpAt("touchEnd", [{ id: 3, x: mid.x + 40, y: mid.y }], t1 + 155);
+await tpAt("touchEnd", [], t1 + 170);
 const three = await sent();
 check("a three-finger tap is a middle click", three.some((m) => m.mask === 2),
       JSON.stringify([...new Set(three.map((m) => m.mask))]));
@@ -352,16 +359,18 @@ await tpAt("touchEnd", [], t0 + 40);
 // whether anything is coasting or not. Position says the pointer actually
 // travelled; count settling says it stopped.
 const probe = `(() => { const n = window.__sent.length; return { n, x: n ? window.__sent[n - 1].x : -1 }; })()`;
+// The coast decays over roughly 550ms from the capped velocity, so "still going"
+// is read early and "stopped" comfortably after that, not at the boundary.
 const atRelease = await evaluate(probe);
-await sleep(400);
+await sleep(300);
 const coasting = await evaluate(probe);
-await sleep(600);
+await sleep(1200);
 const settled = await evaluate(probe);
 check("released at speed, the pointer coasts on",
       Math.abs(coasting.x - atRelease.x) >= 20 && coasting.n > atRelease.n,
-      `x ${atRelease.x} -> ${coasting.x} over ${coasting.n - atRelease.n} updates after the finger left, intents=${JSON.stringify(await intents())}`);
+      `x ${atRelease.x} -> ${coasting.x} over ${coasting.n - atRelease.n} updates after the finger left`);
 check("and the coast stops on its own", settled.n === coasting.n && settled.x === coasting.x,
-      `x ${coasting.x} -> ${settled.x} over the next 600ms`);
+      `x ${coasting.x} -> ${settled.x} over the next 1200ms`);
 
 // A fitted desktop is letterboxed inside its container. A tap on the bars is
 // neither the trackpad's nor the toolbar's — and letting it through means the
