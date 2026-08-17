@@ -49,7 +49,13 @@ WORK="$(mktemp -d)"
 PROFILE="$(mktemp -d)"
 CHROME_PID=""
 cleanup() {
-    [ -n "$CHROME_PID" ] && kill "$CHROME_PID" 2>/dev/null || true
+    # wait, not just kill: chromium is still writing into its profile as it exits,
+    # and removing the directory underneath it printed "Directory not empty" on
+    # every run — noise that reads like a failure and is not one.
+    if [ -n "$CHROME_PID" ]; then
+        kill "$CHROME_PID" 2>/dev/null || true
+        wait "$CHROME_PID" 2>/dev/null || true
+    fi
     rm -rf "$WORK" "$PROFILE"
 }
 trap cleanup EXIT
