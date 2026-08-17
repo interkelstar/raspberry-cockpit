@@ -77,7 +77,10 @@ async function burst(steps) {
 const intents = () => evaluate("window.__intents");
 const settle = () => sleep(650);
 const reset = () => evaluate("window.__sent.length = 0; window.__touch.length = 0; window.__intents.length = 0; true");
-const sent = () => evaluate("window.__sent");
+// A left tap's click is held back by TAP_HOLD_MS in case a drag follows, so
+// reading the wire immediately after a tap would read it before the click.
+const TAP_HOLD_MS = 400;
+const sent = async () => { await sleep(TAP_HOLD_MS + 120); return evaluate("window.__sent"); };
 
 const results = [];
 function check(name, ok, detail) {
@@ -152,8 +155,10 @@ await burst([
   ["touchMove", [{ id: 1, x: mid.x + 15, y: mid.y }]],
 ]);
 for (let i = 1; i <= 8; i++) await tp("touchMove", [{ id: 1, x: mid.x + 15 + i * 10, y: mid.y }]);
-await tp("touchEnd", []);
+// Read the wire BEFORE releasing. A release at speed hands the pointer a coast,
+// and the extra travel would be measured as if the finger had caused it.
 const slide = await sent();
+await tp("touchEnd", []);
 const moves = slide.filter((m) => m.mask === 0);
 const travelled = moves.length ? moves[moves.length - 1].x - moves[0].x : 0;
 const oneToOne = Math.round(80 * scale);
@@ -218,8 +223,33 @@ await tp("touchStart", [{ id: 2, ...mid }], 150);   // and a dwell before moving
 for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x, y: mid.y + i * 12 }]);
 await tp("touchEnd", []);
 const chain = await sent();
+const chainMasks = chain.map((m) => m.mask);
 check("tap, pause, touch and slide drags", chain.filter((m) => m.mask === 1).length >= 3,
-      JSON.stringify(chain.map((m) => m.mask)));
+      JSON.stringify(chainMasks));
+// And the tap's own click must NOT be on the wire in front of the drag. Sent, it
+// pairs with the drag's press into a double click, and a double click on a title
+// bar maximises the window instead of moving it — which is how the bug presented.
+//
+// Bursted on purpose. The suppression window is a real duration, and CDP
+// round-trip latency alone can exceed it, so a paced version of this check tests
+// the harness's speed rather than the plugin's behaviour. The paced check above
+// covers the timing; this one covers the suppression.
+await settle();
+await reset();
+await burst([
+  ["touchStart", [{ id: 1, ...mid }]],
+  ["touchEnd", []],
+  ["touchStart", [{ id: 2, ...mid }]],
+  ["touchMove", [{ id: 2, x: mid.x, y: mid.y + 20 }]],
+  ["touchMove", [{ id: 2, x: mid.x, y: mid.y + 45 }]],
+  ["touchMove", [{ id: 2, x: mid.x, y: mid.y + 70 }]],
+  ["touchEnd", []],
+]);
+const quick = (await sent()).map((m) => m.mask);
+const firstPress = quick.indexOf(1);
+check("the tap that began the drag sent no click of its own",
+      firstPress >= 0 && quick.slice(firstPress).filter((m) => m === 0).length === 1,
+      JSON.stringify(quick));
 
 // Reaching somewhere else after a tap is repositioning, not a drag. This is the
 // cost of a window wide enough to hit, and what the distance condition buys back.
@@ -227,8 +257,14 @@ await settle();
 await reset();
 await tp("touchStart", [{ id: 1, ...mid }], 70);
 await tp("touchEnd", [], 250);
-await tp("touchStart", [{ id: 2, x: mid.x + 120, y: mid.y }], 120);
-for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + i * 12 }]);
+// Touch and first movement together: left to separate round trips, CDP latency
+// can put more than LONG_PRESS_MS between them and the long press turns this into
+// a drag for reasons that have nothing to do with arming.
+await burst([
+  ["touchStart", [{ id: 2, x: mid.x + 120, y: mid.y }]],
+  ["touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + 15 }]],
+]);
+for (let i = 1; i <= 5; i++) await tp("touchMove", [{ id: 2, x: mid.x + 120, y: mid.y + 15 + i * 12 }]);
 await tp("touchEnd", []);
 const far2 = await sent();
 // Exactly one press: the tap's own. A drag would add a second, held across the
@@ -236,6 +272,48 @@ const far2 = await sent();
 check("touching down elsewhere after a tap moves the pointer, it does not drag",
       far2.filter((m) => m.mask === 1).length === 1,
       JSON.stringify(far2.map((m) => m.mask)));
+
+// Inertia: released at speed, the pointer keeps travelling and slows down. Read
+// after the release, so anything further is the coast and not the finger.
+await settle();
+await reset();
+// The direction is chosen from where the POINTER is, not where the finger starts:
+// this is relative pointing, so the finger's position says nothing about how much
+// room the pointer has, and a flick into a nearby edge has nothing to show.
+// Where the pointer is, read from the cursor overlay rather than from the wire:
+// the message buffer was just cleared, and defaulting to "the middle" sent the
+// flick straight into the edge the pointer was already resting against.
+const whereX = await evaluate(`(() => {
+  const c = [...document.body.children].find(e => e.tagName === 'CANVAS' && e.style.position === 'fixed');
+  return c ? parseFloat(c.style.left) || 0 : -1;
+})()`);
+const dir = whereX < (rect.x + rect.w / 2) ? 1 : -1;
+// Paced, not bursted: a flick is a VELOCITY, and bursting collapses the intervals
+// the velocity is computed from. The steps are long enough that even a slow round
+// trip still reads as fast.
+const from = Math.round(mid.x - dir * 110);
+await tp("touchStart", [{ id: 1, x: from, y: mid.y }], 20);
+for (const d of [55, 120, 190]) await tp("touchMove", [{ id: 1, x: from + dir * d, y: mid.y }], 25);
+await tp("touchEnd", [], 0);
+// Counted rather than measured. Acceleration plus a coast can cross the whole
+// 1920px framebuffer, and a clamped pointer keeps reporting the same coordinate —
+// so position proves nothing at the edges while the flow of updates proves both
+// halves of what matters: that it keeps going, and that it stops.
+// Position AND count. Count alone is too weak a signal: noVNC batches pointer
+// moves on a timer of its own, so a few updates trickle out after the release
+// whether anything is coasting or not. Position says the pointer actually
+// travelled; count settling says it stopped.
+const probe = `(() => { const n = window.__sent.length; return { n, x: n ? window.__sent[n - 1].x : -1 }; })()`;
+const atRelease = await evaluate(probe);
+await sleep(400);
+const coasting = await evaluate(probe);
+await sleep(600);
+const settled = await evaluate(probe);
+check("released at speed, the pointer coasts on",
+      Math.abs(coasting.x - atRelease.x) >= 20 && coasting.n > atRelease.n,
+      `x ${atRelease.x} -> ${coasting.x} over ${coasting.n - atRelease.n} updates after the finger left`);
+check("and the coast stops on its own", settled.n === coasting.n && settled.x === coasting.x,
+      `x ${coasting.x} -> ${settled.x} over the next 600ms`);
 
 // A fitted desktop is letterboxed inside its container. A tap on the bars is
 // neither the trackpad's nor the toolbar's — and letting it through means the

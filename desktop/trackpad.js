@@ -16,6 +16,7 @@
 //   {t: "scroll", dx, dy}      finger travel, in finger pixels, sign as on a touch screen
 //   {t: "zoom",   factor, cx, cy}   pinch: scale by factor about the point between the fingers
 //   {t: "pan",    dx, dy}      pinch: the fingers also dragged the image this far
+//   {t: "flick",  vx, vy}      released at speed: let the pointer coast
 //
 // Button numbers follow the DOM: 0 left, 1 middle, 2 right.
 
@@ -74,6 +75,39 @@ export const DRAG_ARM_SLOP = 60;
 // is what keeps a repositioning stroke out: a stroke travels and so ends far
 // from where it began, while a sloppy tap wanders and comes back.
 export const TAP_CHAIN_SLOP = 40;
+
+// A tap's click is held back this long before it is sent.
+//
+// This is the piece that makes tap-tap-drag usable rather than merely present.
+// The click of the first tap is a real click, and on a window title bar a click
+// followed by the drag's press IS a double click: the window maximised instead
+// of moving, before any drag could start. Nothing can retract a click already
+// sent — so it is not sent yet. If a finger comes back and drags, the click is
+// dropped and the remote sees only press, motion, release.
+//
+// Physical touchpads do exactly this, and for exactly this reason: libinput
+// holds a tap's button events for a tap timeout before emitting them. The cost
+// is the same too — a lone click reaches the remote this much later. Longer
+// catches more leisurely tap-drags; shorter feels crisper. If clicks feel laggy,
+// lower it; if a slow tap-drag still maximises windows, raise it.
+//
+// It only ever delays a click that nothing follows: touching the screen again
+// settles the waiting click immediately, whichever way that touch goes. So the
+// full wait is paid by a single, isolated tap and by nothing else.
+export const TAP_HOLD_MS = 400;
+
+// Released faster than this, the pointer coasts instead of stopping dead — the
+// flick a small trackpad needs to cross a large screen. Measured in geared
+// pixels per millisecond, i.e. after acceleration, so it is comparable to how
+// far the pointer was actually travelling.
+export const FLICK_MIN_SPEED = 0.5;
+
+// ...and capped, because one spiky sample must not turn into a launch. Two touch
+// events sharing a millisecond, a coalesced batch, a driver hiccup — any of them
+// can report a velocity an order of magnitude past anything a hand did, and the
+// coast then runs for seconds and floods the wire. Roughly a screen width per
+// third of a second is as fast as coasting is ever useful.
+export const FLICK_MAX_SPEED = 3;
 
 // How much the gap between two fingers must change before the gesture is a
 // pinch rather than a two-finger scroll. Whichever moved further — the gap or
@@ -141,11 +175,22 @@ export function createTrackpad() {
     let twoMode = null;      // once two fingers are down: null | "scroll" | "pinch"
     let twoFrom = null;      // spread + centroid when the second finger landed
     let prevSpread = 0;
+    let pendingClick = null; // a tap's click, held back — see TAP_HOLD_MS
+    let vel = { x: 0, y: 0 };// geared pointer velocity, for the flick
 
     function reset() {
         primaryId = null; last = null; start = null;
         moved = false; maxFingers = 0; scrollFrom = null;
         armed = false; twoMode = null; twoFrom = null;
+        vel = { x: 0, y: 0 };
+    }
+
+    // A held-back click becomes a real one. Called wherever the gesture that
+    // followed turned out NOT to be a drag.
+    function flushPending(out) {
+        if (!pendingClick) return;
+        out.push({ t: "click", button: pendingClick.button });
+        pendingClick = null;
     }
 
     // maxFingers rather than the current count, because fingers rarely land or
@@ -173,6 +218,9 @@ export function createTrackpad() {
                     (now - lastTap.at) <= DRAG_ARM_MS &&
                     Math.hypot(p.x - lastTap.x, p.y - lastTap.y) <= DRAG_ARM_SLOP) {
                     armed = true;
+                } else {
+                    // Not a chain, so whatever click was waiting is just a click.
+                    flushPending(out);
                 }
                 lastTap = null;
             }
@@ -235,7 +283,8 @@ export function createTrackpad() {
 
             const dx = p.x - last.x, dy = p.y - last.y;
             const dist = Math.hypot(dx, dy);
-            const gain = gainFor(dist, now - last.at);
+            const lastAt = last.at;
+            const gain = gainFor(dist, now - lastAt);
             last = { x: p.x, y: p.y, at: now };
 
             if (!moved && Math.hypot(p.x - start.x, p.y - start.y) > TAP_SLOP) moved = true;
@@ -246,10 +295,25 @@ export function createTrackpad() {
             if (armed && held === null && (dx || dy)) {
                 armed = false;
                 held = 0;
+                // THE point of holding it back: this tap was the opening half of
+                // a drag, so its click must never reach the remote. Sent, it
+                // would pair with this press into a double click.
+                pendingClick = null;
                 out.push({ t: "down", button: 0 });
             }
 
-            if (dx || dy) out.push({ t: "move", dx: dx * gain, dy: dy * gain });
+            if (dx || dy) {
+                const gdx = dx * gain, gdy = dy * gain;
+                // Velocity for the flick, smoothed: one jittery final sample
+                // otherwise decides how far the pointer coasts.
+                // lastAt, not last.at: `last` was already advanced to `now`
+                // above, so reading it back gives a one-millisecond interval and
+                // a velocity inflated by whatever the real interval was.
+                const dt = Math.max(1, now - lastAt);
+                const w = 0.6;
+                vel = { x: vel.x * (1 - w) + (gdx / dt) * w, y: vel.y * (1 - w) + (gdy / dt) * w };
+                out.push({ t: "move", dx: gdx, dy: gdy });
+            }
             return out;
         },
 
@@ -289,8 +353,26 @@ export function createTrackpad() {
             if (held !== null) {
                 out.push({ t: "up", button: held });
                 held = null;
+                flushPending(out);
             } else if (!moved && (now - start.at) <= TAP_MAX_MS) {
-                out.push({ t: "click", button: tapButton() });
+                const button = tapButton();
+                // An earlier held-back click is now settled: this gesture was a
+                // tap, not a drag, so the pair is a genuine double click.
+                flushPending(out);
+                // Only the left button waits. A right or middle tap cannot be the
+                // first half of a drag, so there is nothing to gain by delaying it.
+                if (button === 0) pendingClick = { at: now, button: 0 };
+                else out.push({ t: "click", button });
+            } else {
+                flushPending(out);
+                // Let go at speed and the pointer coasts. Not while a button was
+                // held: a drag that kept sliding after release would drop things
+                // somewhere else.
+                const speed = Math.hypot(vel.x, vel.y);
+                if (moved && speed >= FLICK_MIN_SPEED) {
+                    const cap = Math.min(1, FLICK_MAX_SPEED / speed);
+                    out.push({ t: "flick", vx: vel.x * cap, vy: vel.y * cap });
+                }
             }
             lastTap = chainable ? { at: now, x: last.x, y: last.y } : null;
 
@@ -304,9 +386,22 @@ export function createTrackpad() {
             if (primaryId === null || held !== null || moved) return [];
             if ((now - start.at) < LONG_PRESS_MS) return [];
             if (maxFingers > 1) return [];
+            const out = [];
+            // The earlier tap was a tap; this press is a separate, deliberate
+            // hold. Order matters — the click happened first.
+            flushPending(out);
             held = 0;
             armed = false;
-            return [{ t: "down", button: 0 }];
+            out.push({ t: "down", button: 0 });
+            return out;
+        },
+
+        // Ticked by the caller on a timer. A tap that nothing followed has to
+        // become a click on its own; nothing else would ever send it.
+        flush(now) {
+            const out = [];
+            if (pendingClick && (now - pendingClick.at) >= TAP_HOLD_MS) flushPending(out);
+            return out;
         },
 
         // touchcancel, losing the window, switching mode: whatever is held must
@@ -314,6 +409,7 @@ export function createTrackpad() {
         cancel() {
             const out = [];
             if (held !== null) { out.push({ t: "up", button: held }); held = null; }
+            flushPending(out);
             lastTap = null;
             reset();
             return out;
@@ -321,6 +417,7 @@ export function createTrackpad() {
 
         // For the caller's benefit only — the recogniser never reads it.
         get twoFingerMode() { return twoMode; },
+        get clickPending() { return pendingClick !== null; },
 
         get active() { return primaryId !== null; },
         get holding() { return held; },

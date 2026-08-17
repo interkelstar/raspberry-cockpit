@@ -4,7 +4,7 @@ import RFB from "./novnc/core/rfb.js";
 import { readPort, DEFAULT_PORT } from "./config.js";
 // Same reason again: the gesture recognition is where the decisions are, so it
 // lives apart from the DOM and is unit-tested.
-import { createTrackpad, LONG_PRESS_MS } from "./trackpad.js";
+import { createTrackpad, LONG_PRESS_MS, TAP_HOLD_MS } from "./trackpad.js";
 // noVNC grabs the pointer on mousedown by dropping a FULL-SCREEN transparent
 // div (#noVNC_mouse_capture_elem, z-index 10000) over the page, and takes it
 // away again on a mouseup seen at window level. Our synthetic mouseup never
@@ -488,6 +488,48 @@ try {
 // second cursor of our own invention.
 const trackpad = createTrackpad();
 let longPressTimer = null;
+let flushTimer = null;
+
+// How fast the coast decays: velocity is multiplied by e^(-dt/GLIDE_TAU) each
+// frame, so the pointer travels roughly v*TAU further after the finger leaves.
+// Long enough to be worth flicking, short enough that it never feels loose.
+const GLIDE_TAU = 110;
+let glide = null;
+
+function stopGlide() { glide = null; }
+
+// The flick, i.e. pointer inertia. A small trackpad crossing a 1920px desktop
+// needs it as much as acceleration does: the two solve the same problem from
+// different ends, and without inertia every long move is several strokes.
+function startGlide(vx, vy) {
+  glide = { vx, vy, at: null };
+  requestAnimationFrame(stepGlide);
+}
+function stepGlide(now) {
+  if (!glide) return;
+  // The first frame only establishes the clock. Its interval is zero, so it moves
+  // the pointer nowhere — and "went nowhere" is the signal that stops the coast,
+  // so acting on this frame killed every flick on the frame it began.
+  if (glide.at === null) {
+    glide.at = now;
+    requestAnimationFrame(stepGlide);
+    return;
+  }
+  // Frames are capped: coming back from a background tab hands us one enormous
+  // dt, which would teleport the pointer across the screen in a single step.
+  const dt = Math.min(50, now - glide.at);
+  glide.at = now;
+  // Stop the moment the pointer stops going anywhere. Against an edge it is
+  // pinned, and a decaying velocity can stay above the threshold for a long
+  // while — frames burned and a pointer event on the wire for each of them,
+  // every one of them reporting the same coordinate.
+  const went = moveCursor(glide.vx * dt, glide.vy * dt, null);
+  const decay = Math.exp(-dt / GLIDE_TAU);
+  glide.vx *= decay;
+  glide.vy *= decay;
+  if (!went || Math.hypot(glide.vx, glide.vy) < 0.02) { glide = null; return; }
+  requestAnimationFrame(stepGlide);
+}
 
 // Where the pointer is, in CLIENT pixels, kept fractional. Fractional matters:
 // in fit mode the canvas is scaled, so a whole client pixel is several remote
@@ -534,15 +576,17 @@ function placeCursor() {
   return true;
 }
 
+// Returns whether the pointer actually went anywhere — the coast needs to know.
 function moveCursor(dx, dy, held) {
   const c = canvasEl();
-  if (!c) return;
+  if (!c) return false;
   const r = c.getBoundingClientRect();
   // Half a pixel of inset: exactly on the edge, elementFromPoint can return the
   // element behind the canvas and noVNC's Cursor would blink out at the border.
   const minX = r.left + 0.5, maxX = r.right - 0.5;
   const minY = r.top + 0.5, maxY = r.bottom - 0.5;
 
+  const wasX = cursor.x, wasY = cursor.y;
   let x = cursor.x + dx, y = cursor.y + dy;
   const overX = x > maxX ? x - maxX : (x < minX ? x - minX : 0);
   const overY = y > maxY ? y - maxY : (y < minY ? y - minY : 0);
@@ -565,6 +609,9 @@ function moveCursor(dx, dy, held) {
   }
 
   dispatchMouse("mousemove", 0, held);
+  // "Went nowhere" has to include the edge-pan case: pinned against the edge but
+  // scrolling the desktop underneath is still going somewhere.
+  return cursor.x !== wasX || cursor.y !== wasY || !!(overX || overY) && !!(rfb && rfb.clipViewport);
 }
 
 function runIntents(list) {
@@ -589,6 +636,9 @@ function runIntents(list) {
         break;
       case "zoom":
         applyPinch(it.factor, it.cx, it.cy);
+        break;
+      case "flick":
+        startGlide(it.vx, it.vy);
         break;
       case "pan":
         // Fingers moving right show what is further LEFT, so the viewport origin
@@ -619,6 +669,12 @@ function runIntents(list) {
 function armLongPress() {
   clearTimeout(longPressTimer);
   longPressTimer = setTimeout(() => runIntents(trackpad.tick(Date.now())), LONG_PRESS_MS + 20);
+}
+// A tap's click is held back in case a drag follows. If none does, nothing else
+// would ever send it — hence a timer, not a hope.
+function armFlush() {
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(() => runIntents(trackpad.flush(Date.now())), TAP_HOLD_MS + 20);
 }
 
 function points(ev) {
@@ -656,6 +712,10 @@ function within(el, x, y) {
 function handleTouch(ev) {
   if (pointerMode !== "trackpad" || !rfb) return;
 
+  // A finger on the glass stops the coast, wherever it lands and whoever ends up
+  // owning the gesture — including a touch that is only being swallowed.
+  if (ev.type === "touchstart") stopGlide();
+
   if (ev.type === "touchstart" && !engaged && !ignoring) {
     const p = ev.touches[0];
     if (!p) return;
@@ -686,10 +746,20 @@ function handleTouch(ev) {
 
   const now = Date.now();
   const pts = points(ev);
-  if (ev.type === "touchstart") { runIntents(trackpad.touchStart(pts, now)); armLongPress(); }
-  else if (ev.type === "touchmove") runIntents(trackpad.touchMove(pts, now));
-  else if (ev.type === "touchend") { runIntents(trackpad.touchEnd(pts, now)); if (!trackpad.active) clearTimeout(longPressTimer); }
-  else { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); }
+  if (ev.type === "touchstart") {
+    runIntents(trackpad.touchStart(pts, now));
+    armLongPress();
+  } else if (ev.type === "touchmove") {
+    runIntents(trackpad.touchMove(pts, now));
+  } else if (ev.type === "touchend") {
+    runIntents(trackpad.touchEnd(pts, now));
+    if (!trackpad.active) clearTimeout(longPressTimer);
+    armFlush();
+  } else {
+    runIntents(trackpad.cancel());
+    clearTimeout(longPressTimer);
+    stopGlide();
+  }
 }
 // passive:false is required — a passive listener may not preventDefault, and
 // without preventDefault the browser scrolls/zooms the page under the desktop.
@@ -697,12 +767,13 @@ for (const t of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
   document.addEventListener(t, handleTouch, { capture: true, passive: false });
 }
 // A button held when the window goes away would stay held on the remote side.
-window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); engaged = false; ignoring = false; });
+window.addEventListener("blur", () => { runIntents(trackpad.cancel()); clearTimeout(longPressTimer); stopGlide(); engaged = false; ignoring = false; });
 
 function setPointerMode(mode) {
   if (mode === pointerMode) return;
   runIntents(trackpad.cancel());
   clearTimeout(longPressTimer);
+  stopGlide();
   engaged = false;
   ignoring = false;
   pointerMode = mode;
