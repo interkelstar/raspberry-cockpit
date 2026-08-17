@@ -666,15 +666,24 @@ function runIntents(list) {
   }
 }
 
+// Gesture timing is measured from WHEN THE INPUT HAPPENED, not from when we got
+// round to handling it. ev.timeStamp is stamped by the browser as the touch
+// arrives; Date.now() inside the handler adds however long the main thread was
+// busy — and on a phone doing real work that is exactly the moment a queue
+// builds up. A tap can then read as a long press, or a slide as a flick, purely
+// because a frame ran late. performance.now() shares its time origin with
+// ev.timeStamp, so the timer-driven ticks below sit on the same clock.
+const eventTime = (ev) => (typeof ev.timeStamp === "number" && ev.timeStamp > 0 ? ev.timeStamp : performance.now());
+
 function armLongPress() {
   clearTimeout(longPressTimer);
-  longPressTimer = setTimeout(() => runIntents(trackpad.tick(Date.now())), LONG_PRESS_MS + 20);
+  longPressTimer = setTimeout(() => runIntents(trackpad.tick(performance.now())), LONG_PRESS_MS + 20);
 }
 // A tap's click is held back in case a drag follows. If none does, nothing else
 // would ever send it — hence a timer, not a hope.
 function armFlush() {
   clearTimeout(flushTimer);
-  flushTimer = setTimeout(() => runIntents(trackpad.flush(Date.now())), TAP_HOLD_MS + 20);
+  flushTimer = setTimeout(() => runIntents(trackpad.flush(performance.now())), TAP_HOLD_MS + 20);
 }
 
 function points(ev) {
@@ -744,7 +753,7 @@ function handleTouch(ev) {
   ev.preventDefault();
   ev.stopPropagation();
 
-  const now = Date.now();
+  const now = eventTime(ev);
   const pts = points(ev);
   if (ev.type === "touchstart") {
     runIntents(trackpad.touchStart(pts, now));

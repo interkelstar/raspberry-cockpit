@@ -75,6 +75,19 @@ async function burst(steps) {
   await sleep(120);
 }
 const intents = () => evaluate("window.__intents");
+
+// Dispatch with an EXPLICIT event time. The plugin measures gestures from
+// ev.timeStamp rather than from when its handler ran, so the harness can state
+// the timing instead of inheriting whatever CDP latency happened to be — which is
+// the only way a velocity check means the same thing on a fast box and a slow one.
+// CDP wants seconds since the epoch; the page's clock is milliseconds since its
+// own time origin.
+const timeOrigin = await evaluate("performance.timeOrigin");
+async function tpAt(type, points, atMs) {
+  await cdp("Input.dispatchTouchEvent", {
+    type, touchPoints: points.map(touch), timestamp: (timeOrigin + atMs) / 1000,
+  });
+}
 const settle = () => sleep(650);
 const reset = () => evaluate("window.__sent.length = 0; window.__touch.length = 0; window.__intents.length = 0; true");
 // A left tap's click is held back by TAP_HOLD_MS in case a drag follows, so
@@ -288,13 +301,23 @@ const whereX = await evaluate(`(() => {
   return c ? parseFloat(c.style.left) || 0 : -1;
 })()`);
 const dir = whereX < (rect.x + rect.w / 2) ? 1 : -1;
-// Paced, not bursted: a flick is a VELOCITY, and bursting collapses the intervals
-// the velocity is computed from. The steps are long enough that even a slow round
-// trip still reads as fast.
-const from = Math.round(mid.x - dir * 110);
-await tp("touchStart", [{ id: 1, x: from, y: mid.y }], 20);
-for (const d of [55, 120, 190]) await tp("touchMove", [{ id: 1, x: from + dir * d, y: mid.y }], 25);
-await tp("touchEnd", [], 0);
+// The touch and its first move are paced, so the gesture is a slide rather than a
+// long press. The last two moves and the release are bursted, which puts a tiny
+// interval under the final velocity sample and so releases fast on any machine.
+//
+// Paced throughout, this depended on how quickly the harness could talk to the
+// browser: on the Pi the round trips are slower, the release read as gentle, and
+// no flick was produced at all. What speed counts as a flick is a threshold, and
+// thresholds belong to the unit tests, which have an exact clock. This check is
+// here to prove the coast moves the pointer and then stops — so it makes the
+// flick unambiguous and leaves the boundary alone. The velocity cap is what keeps
+// an unrealistically fast release from being unrealistic in its effect too.
+const from = Math.round(mid.x - dir * 60);
+const t0 = await evaluate("performance.now()");
+await tpAt("touchStart", [{ id: 1, x: from, y: mid.y }], t0);
+await tpAt("touchMove", [{ id: 1, x: from + dir * 20, y: mid.y }], t0 + 16);
+await tpAt("touchMove", [{ id: 1, x: from + dir * 60, y: mid.y }], t0 + 32);
+await tpAt("touchEnd", [], t0 + 40);
 // Counted rather than measured. Acceleration plus a coast can cross the whole
 // 1920px framebuffer, and a clamped pointer keeps reporting the same coordinate —
 // so position proves nothing at the edges while the flow of updates proves both
@@ -311,7 +334,7 @@ await sleep(600);
 const settled = await evaluate(probe);
 check("released at speed, the pointer coasts on",
       Math.abs(coasting.x - atRelease.x) >= 20 && coasting.n > atRelease.n,
-      `x ${atRelease.x} -> ${coasting.x} over ${coasting.n - atRelease.n} updates after the finger left`);
+      `x ${atRelease.x} -> ${coasting.x} over ${coasting.n - atRelease.n} updates after the finger left, intents=${JSON.stringify(await intents())}`);
 check("and the coast stops on its own", settled.n === coasting.n && settled.x === coasting.x,
       `x ${coasting.x} -> ${settled.x} over the next 600ms`);
 
