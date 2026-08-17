@@ -926,15 +926,9 @@ function setPointerMode(mode) {
     b.innerHTML = label;
     b.title = title;
     b.setAttribute("aria-label", title);
-    // Contrast that survives a dark desktop behind it. At the previous
-    // rgba(30,30,30,.85) on a 35%-opacity bar these were all but invisible
-    // against a dark background — reported as the buttons having disappeared, and
-    // a screenshot at desktop size confirmed it: present, correctly placed, and
-    // impossible to see. A control nobody can find is not a control.
     b.style.cssText =
-      "width:38px;height:38px;border-radius:8px;border:1px solid rgba(255,255,255,.45);" +
-      "background:rgba(20,20,20,.72);color:#fff;cursor:pointer;" +
-      "box-shadow:0 1px 4px rgba(0,0,0,.55);backdrop-filter:blur(3px);" +
+      "width:38px;height:38px;border-radius:8px;border:1px solid rgba(255,255,255,.2);" +
+      "background:rgba(30,30,30,.85);color:#fff;cursor:pointer;" +
       "display:flex;align-items:center;justify-content:center;padding:0;-webkit-tap-highlight-color:transparent";
     b.addEventListener("click", onclick);
     return b;
@@ -1020,14 +1014,10 @@ function setPointerMode(mode) {
 
   const bar = document.createElement("div");
   bar.id = "ad-desktop-toolbar";
-  // Resting opacity 0.8, not 0.35. The point of dimming is to stay out of the way,
-  // and 0.35 over a dark desktop went past that into not being there at all.
-  const REST = ".8";
   bar.style.cssText =
-    "position:fixed;right:10px;bottom:10px;z-index:50;display:flex;gap:6px;opacity:" + REST +
-    ";transition:opacity .2s";
+    "position:fixed;right:10px;bottom:10px;z-index:50;display:flex;gap:6px;opacity:.35;transition:opacity .2s";
   const wake = () => { bar.style.opacity = "1"; };
-  const dim = () => { bar.style.opacity = REST; };
+  const dim = () => { bar.style.opacity = ".35"; };
   bar.addEventListener("pointerenter", wake);
   bar.addEventListener("pointerleave", dim);
   bar.addEventListener("pointerdown", wake);
