@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
     createTrackpad, gainFor,
     MIN_GAIN, MAX_GAIN, FAST_SPEED,
-    TAP_MAX_MS, TAP_SLOP, DRAG_ARM_MS, DRAG_ARM_SLOP, LONG_PRESS_MS,
+    TAP_MAX_MS, TAP_SLOP, DRAG_ARM_MS, DRAG_ARM_SLOP, TAP_CHAIN_SLOP, LONG_PRESS_MS,
 } from "../desktop/trackpad.js";
 
 const p = (id, x, y) => ({ id, x, y });
@@ -96,6 +96,32 @@ test("a tap followed straight away by a two-finger tap is still a right click", 
     t.touchStart([p(2, 100, 100), p(3, 140, 100)], 120);
     t.touchEnd([p(3, 140, 100)], 200);
     assert.deepEqual(t.touchEnd([], 210), [{ t: "click", button: 2 }]);
+});
+
+// Measured on a phone: 18px of slide during the first tap lost the click AND the
+// drag meant to follow, leaving no gesture at all. A thumb tapping twice quickly
+// slides that far routinely, which is why "is this a click" and "was that the
+// first of two taps" get different slops.
+test("a tap too sloppy to click still arms the drag", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    const wobbled = t.touchMove([p(1, 100 + TAP_SLOP + 8, 100)], 30);
+    assert.deepEqual(types(wobbled), ["move"]);           // too far to be a click
+    assert.deepEqual(t.touchEnd([], 60), []);             // so no click is sent
+    t.touchStart([p(2, 100 + TAP_SLOP + 8, 100)], 200);   // ...but the chain is open
+    assert.deepEqual(types(t.touchMove([p(2, 200, 100)], 250)), ["down", "move"]);
+});
+
+// The distance is measured from where the gesture STARTED, which is what keeps a
+// repositioning stroke out of the chain: a stroke travels, a sloppy tap wanders
+// and comes back.
+test("a stroke that travelled does not arm a drag, however brief", () => {
+    const t = createTrackpad();
+    t.touchStart([p(1, 100, 100)], 0);
+    t.touchMove([p(1, 100 + TAP_CHAIN_SLOP + 20, 100)], 40);
+    t.touchEnd([], 60);
+    t.touchStart([p(2, 100 + TAP_CHAIN_SLOP + 20, 100)], 150);
+    assert.deepEqual(types(t.touchMove([p(2, 300, 100)], 200)), ["move"]);
 });
 
 test("a plain double tap is two clicks, with no stray press between them", () => {

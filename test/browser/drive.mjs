@@ -141,10 +141,17 @@ check("the button switches mode, and says which mode is now in force",
 await sleep(200);
 
 // A slow slide: the pointer must move, and by LESS than 1:1 mapping would give.
+// The touch and its first movement go together, so the gesture is committed to
+// being a slide before anything else can claim it. Left to separate round trips,
+// CDP latency put more than LONG_PRESS_MS between them and the slide came out as
+// a long-press drag — a property of the harness, not of the plugin.
 await settle();
 await reset();
-await tp("touchStart", [{ id: 1, ...mid }]);
-for (let i = 1; i <= 8; i++) await tp("touchMove", [{ id: 1, x: mid.x + i * 10, y: mid.y }]);
+await burst([
+  ["touchStart", [{ id: 1, ...mid }]],
+  ["touchMove", [{ id: 1, x: mid.x + 15, y: mid.y }]],
+]);
+for (let i = 1; i <= 8; i++) await tp("touchMove", [{ id: 1, x: mid.x + 15 + i * 10, y: mid.y }]);
 await tp("touchEnd", []);
 const slide = await sent();
 const moves = slide.filter((m) => m.mask === 0);

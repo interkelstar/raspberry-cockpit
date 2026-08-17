@@ -56,7 +56,24 @@ export const DRAG_ARM_MS = 500;
 // somewhere else to slide", and a widened window makes that worse; requiring
 // the finger to come back down where it left cuts the false drags without
 // narrowing the window again.
-export const DRAG_ARM_SLOP = 45;
+export const DRAG_ARM_SLOP = 60;
+
+// How far a gesture may travel and still count as the FIRST HALF of a double
+// tap. This is deliberately much looser than TAP_SLOP, and separating the two is
+// the difference between the gesture working in a hand and not.
+//
+// The two questions are not the same question. "Is this a click?" needs a tight
+// slop, or a deliberate slide would click. "Was that the first of two taps?"
+// needs a loose one, because a thumb tapping twice in a hurry slides — measured,
+// 18px of slide in the first tap was enough to lose the click AND the drag that
+// was meant to follow it, leaving no gesture at all. Android draws the same
+// distinction, and far more sharply: 8dp of touch slop against 100dp of
+// double-tap slop.
+//
+// It stays a distance from the gesture's START, not a total path length, which
+// is what keeps a repositioning stroke out: a stroke travels and so ends far
+// from where it began, while a sloppy tap wanders and comes back.
+export const TAP_CHAIN_SLOP = 40;
 
 // How much the gap between two fingers must change before the gesture is a
 // pinch rather than a two-finger scroll. Whichever moved further — the gap or
@@ -259,24 +276,23 @@ export function createTrackpad() {
                 return out;
             }
 
+            // Can this gesture be the first half of a double tap? One finger
+            // only — chaining a drag onto a right-click would press the LEFT
+            // button, which is not what the finger asked for — quick, and it has
+            // to have ended near where it began. Note this is decided
+            // independently of whether a click was delivered: a tap too sloppy
+            // to click is still a tap as far as the next touch is concerned.
+            const chainable = maxFingers === 1 &&
+                (now - start.at) <= TAP_MAX_MS &&
+                Math.hypot(last.x - start.x, last.y - start.y) <= TAP_CHAIN_SLOP;
+
             if (held !== null) {
                 out.push({ t: "up", button: held });
-                // A held button that was never dragged is the second half of a
-                // tap-tap-drag that turned out to be an ordinary double tap.
-                // Keep the chain open so a third tap still arms a drag.
-                lastTap = (!moved && (now - start.at) <= TAP_MAX_MS)
-                    ? { at: now, x: last.x, y: last.y } : null;
                 held = null;
             } else if (!moved && (now - start.at) <= TAP_MAX_MS) {
-                const button = tapButton();
-                out.push({ t: "click", button });
-                // Only a one-finger tap can arm a drag. Chaining a drag onto a
-                // right-click would press the LEFT button, which is not what the
-                // finger asked for.
-                lastTap = button === 0 ? { at: now, x: last.x, y: last.y } : null;
-            } else {
-                lastTap = null;
+                out.push({ t: "click", button: tapButton() });
             }
+            lastTap = chainable ? { at: now, x: last.x, y: last.y } : null;
 
             reset();
             return out;
