@@ -82,6 +82,31 @@ if [ "$UNINSTALL" = 1 ]; then
     exit 0
 fi
 
+# Every module reachable from app.js, as paths relative to the plugin directory.
+# Derived by following the imports rather than listed by hand, for the same reason
+# the file copy is: a hand-written list is a list that goes stale silently.
+module_graph() {
+    local dir="$1" queue="app.js" seen="" cur spec res
+    while [ -n "$queue" ]; do
+        cur="${queue%%$'\n'*}"
+        case "$queue" in *$'\n'*) queue="${queue#*$'\n'}" ;; *) queue="" ;; esac
+        case $'\n'"$seen"$'\n' in *$'\n'"$cur"$'\n'*) continue ;; esac
+        seen="${seen:+$seen$'\n'}$cur"
+        # A module already installed is a COMPRESSED module: reading only the plain
+        # name made this walk stop at the first noVNC file on every run after the
+        # first, and the preload list silently shrank from 49 entries to 5.
+        if [ -f "$dir/$cur" ]; then read_cur() { cat "$dir/$cur"; }
+        elif [ -f "$dir/$cur.gz" ]; then read_cur() { zcat "$dir/$cur.gz"; }
+        else continue
+        fi
+        for spec in $(read_cur | grep -oE '(from|import)[[:space:]]*"\.[^"]+"' | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+            res="$(cd "$dir/$(dirname "$cur")" 2>/dev/null && realpath -m --relative-to="$dir" "$spec")" || continue
+            queue="${queue:+$queue$'\n'}$res"
+        done
+    done
+    printf '%s\n' "$seen"
+}
+
 # --- Preconditions ----------------------------------------------------------
 say "Checks"
 
@@ -310,6 +335,77 @@ UNITEOF
     done
     run "sudo chmod 0755 $PLUGIN_DIR"
     ok "plugin installed in $PLUGIN_DIR ($(ls -1 "$SRC"/desktop | wc -l) files)"
+
+    # noVNC is ~54 ES modules and half a megabyte of JavaScript, and the browser
+    # discovers them in waves: index.html finds app.js, app.js finds rfb.js,
+    # rfb.js finds twenty more, and so on. Every wave costs a round trip before
+    # the next one can even start. Naming the whole graph up front collapses that
+    # into one wave of parallel fetches.
+    #
+    # This is injected into the INSTALLED copy rather than kept in the repository
+    # because the list is whatever noVNC happens to ship on this machine. It is a
+    # transport hint with no effect on behaviour, which is why the test harness
+    # can go on building its page from the repository's index.html.
+    if [ "$DRY" = 1 ]; then
+        printf '   \033[90m[dry] inject modulepreload links into %s/index.html\033[0m\n' "$PLUGIN_DIR"
+    else
+        graph="$(module_graph "$PLUGIN_DIR")"
+        links="$(printf '%s\n' "$graph" | sed 's|.*|  <link rel="modulepreload" href="&">|')"
+        printf '%s\n' "$links" > /tmp/rc-preload.$$
+        sudo python3 - "$PLUGIN_DIR/index.html" /tmp/rc-preload.$$ <<'PYEOF'
+import sys, re
+page, links = sys.argv[1], sys.argv[2]
+html = open(page).read()
+html = re.sub(r'\n?\s*<link rel="modulepreload"[^>]*>', '', html)
+html = html.replace("</head>", open(links).read() + "</head>", 1)
+open(page, "w").write(html)
+PYEOF
+        rm -f /tmp/rc-preload.$$
+        ok "$(printf '%s\n' "$graph" | wc -l) modules preloaded from index.html"
+    fi
+
+    # Cockpit serves a package file named `x.js.gz` in answer to a request for
+    # `x.js`, with Content-Encoding: gzip. From src/cockpit/packages.py:
+    #
+    #     basename = re.sub(r'.gz$', '', name)      # strip trailing '.gz'
+    #     self.files[basename] = name
+    #     content_type, content_encoding = mimetypes.guess_type(filename)
+    #
+    # and mimetypes.guess_type('app.js.gz') is ('text/javascript', 'gzip'). Ours
+    # shipped nothing compressed, so half a megabyte of noVNC went over the wire
+    # raw — on a phone, through a tunnel, that is the difference between the tab
+    # appearing and the tab eventually appearing.
+    #
+    # The plain file is REPLACED, not kept beside it. Both present map to the same
+    # key in that dict and the scan order decides which one wins, so keeping both
+    # is not a safe superset — it is a coin toss. Cockpit's own packages ship the
+    # .gz alone for the same reason: /usr/share/cockpit/shell has shell.js.gz and
+    # no shell.js.
+    #
+    # index.html and manifest.json stay plain: Cockpit reads the manifest itself,
+    # and its own packages keep both uncompressed.
+    if [ "$DRY" = 1 ]; then
+        printf '   \033[90m[dry] compress js/css in %s for cockpit-ws\033[0m\n' "$PLUGIN_DIR"
+    else
+        # Compress what is still plain, and DO NOT clear the .gz files first.
+        # Clearing them looks like the tidy way to avoid stale output and is in
+        # fact destructive: noVNC is copied only when absent, so on the second run
+        # its sources are already compressed — deleting every .gz and then
+        # compressing "every .js" removes sixty files and finds nothing to replace
+        # them with. Measured, before this line was written the way it is now: 80
+        # noVNC modules became 20.
+        before=$(sudo du -sk "$PLUGIN_DIR" | cut -f1)
+        sudo find "$PLUGIN_DIR" \( -name '*.js' -o -name '*.css' \) -exec gzip -9 -f {} +
+        # Stale output is still worth removing, but only where we can tell it IS
+        # stale: our own files, whose source list is right here.
+        for g in "$PLUGIN_DIR"/*.gz; do
+            [ -e "$g" ] || continue
+            b="$(basename "${g%.gz}")"
+            [ -e "$SRC/desktop/$b" ] || run "sudo rm -f '$g'"
+        done
+        after=$(sudo du -sk "$PLUGIN_DIR" | cut -f1)
+        ok "compressed for cockpit-ws ($(sudo find "$PLUGIN_DIR" -name '*.gz' | wc -l) files, ${before}kB -> ${after}kB)"
+    fi
 
     run "sudo install -d -m 0755 /etc/cockpit"
     if [ "$DRY" = 1 ]; then

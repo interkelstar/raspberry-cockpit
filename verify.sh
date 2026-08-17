@@ -63,15 +63,35 @@ else
     for f in "$SRC"/desktop/*; do
         [ -f "$f" ] || continue
         b="$(basename "$f")"
-        [ -e "$PLUGIN_DIR/$b" ] || { bad "$b is in desktop/ but not installed"; missing=1; }
+        # Installed as $b or as $b.gz — Cockpit answers a request for x.js with
+        # x.js.gz, so the compressed name is the installed name.
+        [ -e "$PLUGIN_DIR/$b" ] || [ -e "$PLUGIN_DIR/$b.gz" ] \
+            || { bad "$b is in desktop/ but not installed"; missing=1; }
     done
     [ "$missing" = 0 ] && ok "every file from desktop/ is installed ($(ls -1 "$SRC"/desktop | wc -l))"
-    [ -e "$PLUGIN_DIR/novnc/core/rfb.js" ] && ok "noVNC client present" || bad "novnc/core/rfb.js missing"
+    [ -e "$PLUGIN_DIR/novnc/core/rfb.js" ] || [ -e "$PLUGIN_DIR/novnc/core/rfb.js.gz" ] \
+        && ok "noVNC client present" || bad "novnc/core/rfb.js missing"
+
+    # Both names present is NOT a safe superset: they map to the same key in
+    # Cockpit's file table and the directory scan order picks the winner.
+    dupes=$(sudo find "$PLUGIN_DIR" -name '*.gz' | sed 's/\.gz$//' | while read -r p; do [ -e "$p" ] && echo "$p"; done | wc -l)
+    [ "$dupes" = 0 ] && ok "no file installed both compressed and plain" \
+                     || bad "$dupes file(s) exist as both x and x.gz — which one Cockpit serves is scan order"
+
     # Last line of defence: a file can exist and still point at nothing. That is
     # exactly what a blank tab looked like.
+    app="$PLUGIN_DIR/app.js"; reader=cat
+    [ -e "$app" ] || { app="$PLUGIN_DIR/app.js.gz"; reader=zcat; }
     while read -r dep; do
-        [ -e "$PLUGIN_DIR/$dep" ] && ok "import ./$dep resolves" || bad "app.js imports ./$dep, which is absent"
-    done < <(grep -oE 'from "\./[^"]+"' "$PLUGIN_DIR/app.js" 2>/dev/null | sed 's|from "\./||; s|"$||')
+        [ -e "$PLUGIN_DIR/$dep" ] || [ -e "$PLUGIN_DIR/$dep.gz" ] \
+            && ok "import ./$dep resolves" || bad "app.js imports ./$dep, which is absent"
+    done < <($reader "$app" 2>/dev/null | grep -oE 'from "\./[^"]+"' | sed 's|from "\./||; s|"$||')
+
+    # Every module the page will pull must be named up front, or the browser
+    # discovers them in waves and pays a round trip for each wave.
+    pre=$(grep -c 'rel="modulepreload"' "$PLUGIN_DIR/index.html" 2>/dev/null || echo 0)
+    [ "$pre" -gt 20 ] && ok "index.html preloads the module graph ($pre modules)" \
+                      || bad "index.html preloads only $pre modules — the graph is not being named up front"
 
     if [ -r "$CONFIG" ]; then
         port=$(grep -oE '^[ \t]*port[ \t]*=[ \t]*[0-9]+' "$CONFIG" | grep -oE '[0-9]+$')
