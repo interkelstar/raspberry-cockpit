@@ -366,7 +366,14 @@ function refreshNative() {
 let nativeTimer = null;
 function refreshNativeSoon() {
   clearTimeout(nativeTimer);
-  nativeTimer = setTimeout(refreshNative, 120);
+  nativeTimer = setTimeout(() => {
+    refreshNative();
+    // ...and redraw with what was just measured. Debouncing the measurement
+    // without this leaves the frame drawn from the PREVIOUS insets until
+    // something else happens to redraw it: the numbers arrive after the only
+    // consumer has already run.
+    updateFrame();
+  }, 120);
 }
 // The frame is dropped only when Cockpit has moved the nav out of the left column into its
 // collapsed/hamburger mode (the masthead toggle becomes visible) — NOT merely on a narrow or
