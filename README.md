@@ -106,6 +106,20 @@ The page is noVNC: 49 ES modules and 622kB of JavaScript. Two things are done ab
 
 That second point replaced a `modulepreload` pass which named all 49 modules up front so the browser would not discover them in waves. It is *removed*, because it made the thing it was meant to fix worse: **cockpit-ws speaks HTTP/1.1**, so a browser has roughly six connections per host, and forty-nine preload links in the `<head>` are queued before the parser ever reaches the script the whole tab waits on. Reported from a network panel as `cockpit.js` loading so slowly it had to be cancelled. Compression stays — fewer bytes helps on any connection and cannot reorder anything. If Cockpit ever serves HTTP/2 this is worth revisiting; there the preloads would cost nothing.
 
+## If pages take tens of seconds to arrive
+
+Check `cockpit-tls` before suspecting anything here:
+
+```sh
+ps -eo pcpu,comm --sort=-pcpu | head -3
+```
+
+**Cockpit before 356 has a busy loop in it** — `cockpit-tls` spins on `poll()` with a zero timeout and burns whole cores, and everything it fronts crawls. Measured on the test board: four cores consumed with *zero* connections open, a 1.4kB page taking 30 seconds, and a font belonging to Cockpit's own shell taking the same 30 seconds beside it. That last detail is the giveaway — when an unrelated resource waits exactly as long as yours, the two are queued behind a shared resource, not a shared bug.
+
+Upstream [#22274](https://github.com/cockpit-project/cockpit/issues/22274), fixed by *"tls: Fix non-blocking poll() loop"*, first released in **356**. Debian trixie ships 337; **trixie-backports has 365**. `verify.sh` says which side of that line you are on.
+
+A long-lived console like this one is one of the reported triggers, so the plugin makes it likelier to be hit — it does not cause it.
+
 ## Requirements
 
 - Raspberry Pi OS (or another Debian-like; Fedora/RHEL paths exist but are untested)

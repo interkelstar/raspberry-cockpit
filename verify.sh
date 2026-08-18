@@ -47,6 +47,22 @@ else
     fi
 fi
 
+    # Cockpit before 356 has a busy loop in cockpit-tls: it spins on poll() with a
+    # zero timeout and burns whole cores, and everything it fronts crawls —
+    # measured on the test board at four cores with ZERO connections open, and a
+    # 1.4kB page taking thirty seconds to arrive. Upstream issue 22274, fixed by
+    # "tls: Fix non-blocking poll() loop". Worth saying out loud, because the
+    # symptom looks exactly like a slow plugin.
+    cver=$(cockpit-bridge --version 2>/dev/null | awk '/Version/ {print $2}')
+    case "$cver" in
+        '') : ;;
+        *) if [ "${cver%%[!0-9]*}" -lt 356 ] 2>/dev/null; then
+               warn "cockpit $cver: below 356, so cockpit-tls can spin at 100% and make every page crawl (upstream #22274)"
+           else
+               ok "cockpit $cver — past the cockpit-tls busy loop fixed in 356"
+           fi ;;
+    esac
+
 hdr "File browser"
 if [ -d "$FILES_DIR" ]; then
     ok "module present"
