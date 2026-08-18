@@ -296,16 +296,16 @@ if want desktop; then
                 apt) VPKG=tigervnc-standalone-server ;;
                 dnf) VPKG=tigervnc-server ;;
             esac
-            # -localhost and SecurityTypes=None belong together: a server without
-            # authentication must not be reachable from off the machine.
+            # A unix socket here too, for the same reason as on Wayland: a no-auth
+            # RFB listener on 127.0.0.1 is reachable by every process of every UID
+            # on the box. x0vncserver takes -rfbunixpath, and -rfbunixmode is
+            # already 0600 by default; the socket still goes in a 0700 directory,
+            # because a mode is a property of the file and a directory is a
+            # property of everything in it.
             #
-            # Unlike the Wayland path this stays on a loopback PORT, which means
-            # any local process can drive it, whatever its UID. x0vncserver does
-            # document -rfbunixpath/-rfbunixmode and that would close it the same
-            # way, but this path has no test board behind it and a wrong guess
-            # here fails as a unit that never starts. Stated plainly in the README
-            # rather than quietly assumed to be equivalent.
-            EXEC="x0vncserver -display :0 -rfbport $PORT -SecurityTypes=None -localhost -SendPrimary=0"
+            # -SecurityTypes=None stays: authentication is Cockpit's job, and it
+            # has already happened by the time anything can reach this.
+            EXEC="x0vncserver -display :0 -rfbunixpath $VNC_SOCK -rfbunixmode 0600 -SecurityTypes=None -SendPrimary=0"
             ;;
     esac
     command -v "$BIN" >/dev/null 2>&1 && skip "$BIN already installed" || run "sudo $PKG install -y $VPKG"
@@ -332,19 +332,10 @@ WVEOF
         ok "wayvnc config: $WVCONF (unix socket, owner only, no auth)"
     fi
 
-    # Only the port path can collide; a socket we own cannot be taken by someone
-    # else. Skipping the check whenever our own unit is active was wrong: the case
-    # that matters is a unit already running on 5901 while the user asks for 5902
-    # and something unrelated holds 5902. Compare against the port the running
-    # unit actually uses instead, so re-running unchanged is quiet and a real
-    # collision is not.
-    if [ "$SESSION_TYPE" != wayland ]; then
-        taken=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*[:.]//' | grep -Fx "$PORT" || true)
-        running=$(systemctl --user show -p ExecStart --value "$UNIT" 2>/dev/null | grep -oE 'rfbport [0-9]+' | grep -oE '[0-9]+' || true)
-        if [ -n "$taken" ] && [ "$running" != "$PORT" ]; then
-            die "port $PORT is already taken — pick another: --port $((PORT+1))"
-        fi
-    fi
+    # No port-collision check any more: both session types listen on a socket we
+    # own, and a path we create cannot be taken by somebody else the way a port
+    # can. --port is kept for the plugin's fallback and for anyone pointing it at
+    # a server of their own.
 
     # A user unit, not a system one: the VNC server must see its own user's
     # session, and a system service cannot reach into it.
@@ -399,11 +390,7 @@ UNITEOF
     if [ "$DRY" = 1 ]; then
         ok "$UNIT would be started"
     elif systemctl --user is-active --quiet "$UNIT"; then
-        if [ "$SESSION_TYPE" = wayland ]; then
-            ok "$UNIT up on $VNC_SOCK (owner only, no auth)"
-        else
-            ok "$UNIT up on 127.0.0.1:$PORT (no auth, not listening outside)"
-        fi
+        ok "$UNIT up on $VNC_SOCK (owner only, no auth)"
     else
         die "$UNIT did not start — systemctl --user status $UNIT, journalctl --user -u $UNIT"
     fi
@@ -525,21 +512,12 @@ UNITEOF
 
     run "sudo install -d -m 0755 /etc/cockpit"
     if [ "$DRY" = 1 ]; then
-        if [ "$SESSION_TYPE" = wayland ]; then
-            printf '   \033[90m[dry] write %s (socket=%s)\033[0m\n' "$CONFIG" "$VNC_SOCK"
-        else
-            printf '   \033[90m[dry] write %s (port=%s)\033[0m\n' "$CONFIG" "$PORT"
-        fi
+        printf '   \033[90m[dry] write %s (socket=%s)\033[0m\n' "$CONFIG" "$VNC_SOCK"
     else
-        if [ "$SESSION_TYPE" = wayland ]; then
-            printf '# Where the Cockpit Desktop tab finds VNC. Read when the tab loads.\n# A unix socket: reachable by its owner, not by every local process.\nsocket=%s\n' \
-                "$VNC_SOCK" | sudo tee "$CONFIG" >/dev/null
-        else
-            printf '# Where the Cockpit Desktop tab finds VNC. Read when the tab loads.\nport=%s\n' "$PORT" \
-                | sudo tee "$CONFIG" >/dev/null
-        fi
+        printf '# Where the Cockpit Desktop tab finds VNC. Read when the tab loads.\n# A unix socket: reachable by its owner, not by every local process.\nsocket=%s\n' \
+            "$VNC_SOCK" | sudo tee "$CONFIG" >/dev/null
     fi
-    if [ "$SESSION_TYPE" = wayland ]; then ok "$CONFIG: socket=$VNC_SOCK"; else ok "$CONFIG: port=$PORT"; fi
+    ok "$CONFIG: socket=$VNC_SOCK"
 fi
 
 # --- Branding ---------------------------------------------------------------

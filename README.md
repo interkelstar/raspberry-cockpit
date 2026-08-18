@@ -63,7 +63,7 @@ Which makes where it listens the whole of its security, and a loopback port is n
 
 Measured while doing this, and worth knowing if you rely on the usual assumption: `/run/user/1000` on Raspberry Pi OS is **770, not 700**, and `wayvnc` creates its socket **775** — so neither the runtime directory nor the socket's own mode would have kept group members out. Owning the parent directory is what settles it.
 
-The X11 path (`x0vncserver`) still uses a loopback port, so there any local process can drive it. `x0vncserver` documents `-rfbunixpath`, which would close it the same way, but there is no test board behind that path here and a wrong guess produces a unit that never starts. Stated rather than quietly assumed to be equivalent.
+The X11 path does the same, with `x0vncserver -rfbunixpath` (whose `-rfbunixmode` already defaults to 0600). Verified on Fedora 44 with XFCE under Xorg: socket 0600 in a 0700 directory, an RFB banner on it, and `cockpit-bridge` able to open it — and a second `x0vncserver` on the same display coexists with an existing one quite happily.
 
 A useful side effect: the plugin contains no reference to X11, Wayland, or any particular VNC server. It opens a stream and speaks RFB; where the pixels come from is invisible to it. The installer picks the server (`wayvnc` for Wayland, `x0vncserver` for X11) by detecting the **live session**, not by reading the distribution name.
 

@@ -193,7 +193,7 @@ s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1]); sys.st
         # authentication is their business, and claiming "no unauthenticated port
         # is open" would be asserting something this script cannot know.
         [ -z "$stray" ] && ok "no VNC listening on TCP at all" \
-                        || warn "TCP VNC also present on $stray — not ours (raspi-config? Pi Connect?)"
+                        || warn "TCP VNC also present on $stray — not ours, and a no-auth one there would be reachable by any local user"
     elif [ -n "${port:-}" ]; then
         # The server must listen on localhost ONLY: it has no authentication.
         listen=$(ss -tln 2>/dev/null | awk -v p="$port" '{n=split($4,a,":"); if (a[n]==p) print $4}' | head -1)
