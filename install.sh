@@ -305,7 +305,13 @@ if want desktop; then
             #
             # -SecurityTypes=None stays: authentication is Cockpit's job, and it
             # has already happened by the time anything can reach this.
-            EXEC="x0vncserver -display :0 -rfbunixpath $VNC_SOCK -rfbunixmode 0600 -SecurityTypes=None -SendPrimary=0"
+            #
+            # -rfbport -1: -rfbunixpath ADDS a listener, it does not replace the
+            # default TCP one, so without this x0vncserver also listens on
+            # 0.0.0.0:5900 with no auth (seen on the operator VPS, 2026-10-31,
+            # hidden only by the firewall). -1 disables the TCP listener;
+            # verified on TigerVNC 1.16 / Fedora 44.
+            EXEC="x0vncserver -display :0 -rfbport -1 -rfbunixpath $VNC_SOCK -rfbunixmode 0600 -SecurityTypes=None -SendPrimary=0"
             ;;
     esac
     command -v "$BIN" >/dev/null 2>&1 && skip "$BIN already installed" || run "sudo $PKG install -y $VPKG"
